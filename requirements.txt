@@ -1,0 +1,25 @@
+# 核心（建议始终安装）
+markitdown
+
+# PDF 解析（按需安装）
+pymupdf
+pypdf
+pdfplumber
+pdfminer.six
+liteparse
+
+# Word 解析
+python-docx
+
+# PPT 解析
+python-pptx
+
+# Excel 解析
+openpyxl
+
+# HTML 解析
+beautifulsoup4
+
+# OCR（可选，需要系统 Tesseract OCR）
+pytesseract
+pillow

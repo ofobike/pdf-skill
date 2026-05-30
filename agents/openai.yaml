@@ -1,0 +1,4 @@
+interface:
+  display_name: "Document Parse Compare"
+  short_description: "Document intelligence: parse, classify, OCR, extract, verify, and pack"
+  default_prompt: "Use $document-parse-compare to classify this document, choose the best extraction strategy, and produce traceable outputs or structured fields."
