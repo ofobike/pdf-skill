@@ -1,29 +1,29 @@
 ---
-name: document-parse-compare
-description: Parse, convert, batch-convert, scan, auto-process, classify, package, and compare text extraction quality for local documents. Use when Codex needs to extract or compare content from PDF, DOCX, PPTX, XLSX, or HTML files; diagnose `(cid:...)`, blank, garbled, or low-quality extraction; choose among markitdown and format-specific parsers; enforce quality gates; render PDF page screenshots; output PDF layout JSON; chunk text by character or page; extract PDF tables; extract and verify structured invoice fields; export invoice summaries to XLSX; run optional Tesseract OCR or auto OCR fallback; classify document type; generate traceable RAG/knowledge packs; or decide whether OCR or a better source file is needed.
+name: document-skill
+description: Parse, convert, batch-convert, scan, auto-process, classify, package, and compare text extraction quality for local documents. Use when Codex needs to extract or compare content from PDF, DOCX, PPTX, XLSX, HTML, TXT, CSV, JSON, XML, images, audio, EPub, or ZIP files; diagnose `(cid:...)`, blank, garbled, or low-quality extraction; choose among markitdown and format-specific parsers; enforce quality gates; render PDF page screenshots; output PDF layout JSON; chunk text by character or page; extract PDF tables; extract and verify structured invoice fields; export invoice summaries to XLSX; run optional Tesseract OCR or auto OCR fallback; classify document type; generate traceable RAG/knowledge packs; or decide whether OCR or a better source file is needed.
 ---
 
-# Document Parse Compare
+# Document Skill
 
 ## Triggering
 
 Explicit Codex invocation:
 
 ```text
-$document-parse-compare
+$document-skill
 ```
 
 Use this skill explicitly when the user says things like:
 
-- `Use $document-parse-compare to compare this PDF parser output.`
-- `Use $document-parse-compare to convert this DOCX to JSON.`
-- `Use $document-parse-compare to extract PDF tables as CSV and JSON.`
-- `Use $document-parse-compare to scan a directory and fail if PDF quality is bad.`
-- `Use $document-parse-compare to render PDF pages and OCR page 1.`
-- `Use $document-parse-compare to auto-process this PDF and extract invoice fields.`
-- `Use $document-parse-compare to export these invoices to XLSX.`
-- `Use $document-parse-compare to classify this document and recommend a strategy.`
-- `Use $document-parse-compare to build a knowledge pack for this PDF.`
+- `Use $document-skill to compare this PDF parser output.`
+- `Use $document-skill to convert this DOCX to JSON.`
+- `Use $document-skill to extract PDF tables as CSV and JSON.`
+- `Use $document-skill to scan a directory and fail if PDF quality is bad.`
+- `Use $document-skill to render PDF pages and OCR page 1.`
+- `Use $document-skill to auto-process this PDF and extract invoice fields.`
+- `Use $document-skill to export these invoices to XLSX.`
+- `Use $document-skill to classify this document and recommend a strategy.`
+- `Use $document-skill to build a knowledge pack for this PDF.`
 
 The skill should also be used implicitly for requests such as:
 
@@ -50,7 +50,7 @@ The skill should also be used implicitly for requests such as:
 - Classify documents and choose a processing strategy.
 - Generate traceable knowledge packs for one file or a directory.
 
-Claude-style `/pdf-compare` is legacy compatibility only. Codex triggering uses `$document-parse-compare` and the frontmatter description above.
+Claude-style `/pdf-compare` is legacy compatibility only. Codex triggering uses `$document-skill` and the frontmatter description above.
 
 ## Use The Bundled Script
 
@@ -77,11 +77,16 @@ Prefer `scripts/parse_document_compare.py` for deterministic document parsing wo
 
 Supported inputs:
 
-- PDF: `markitdown`, `pymupdf`, `pypdf`, `pdfplumber`, `pdfminer`, `liteparse`
-- DOCX: `markitdown`, `python-docx`
-- PPTX: `markitdown`, `python-pptx`
-- XLSX: `markitdown`, `openpyxl`
+- PDF: `markitdown`, `pymupdf`, `pypdf`, `pdfplumber`, `pdfminer`, `liteparse`, `opendataloader` (requires Java)
+- Word: `markitdown`, `python-docx`
+- PPT: `markitdown`, `python-pptx`
+- Excel: `markitdown`, `openpyxl`
 - HTML: `markitdown`, `beautifulsoup4`
+- Text: `markitdown` (TXT, CSV, JSON, XML, MD)
+- Image: `markitdown` (JPG, PNG, GIF, BMP, TIFF, WebP — EXIF + OCR, requires Tesseract)
+- Audio: `markitdown` (MP3, WAV — EXIF + speech transcription, requires whisper)
+- EPub: `markitdown`
+- Archive: `markitdown` (ZIP — iterates over contents)
 
 Legacy binary Office formats such as `.doc`, `.ppt`, and `.xls` may be detected, but prefer asking for modern `.docx`, `.pptx`, or `.xlsx` files when parser support is unreliable.
 

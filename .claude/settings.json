@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python scripts/parse_document_compare.py doctor --format image)",
+      "Bash(python scripts/parse_document_compare.py doctor)",
+      "Bash(python scripts/parse_document_compare.py convert \"test_files/test.txt\" --format md -o \"test_files/test_txt_output.md\")",
+      "Bash(python scripts/parse_document_compare.py convert \"test_files/test.csv\" --format md -o \"test_files/test_csv_output.md\")",
+      "Bash(python scripts/parse_document_compare.py convert \"test_files/test.json\" --format md -o \"test_files/test_json_output.md\")",
+      "Bash(find \"C:/Users/hspcadmin\" -name \"*.jpg\" -o -name \"*.png\" 2>/dev/null | head -5)",
+      "Read(//c/Users/hspcadmin/**)",
+      "Bash(python scripts/parse_document_compare.py convert \"C:/Users/hspcadmin/.antigravity/extensions/golang.go-0.52.2-universal/media/go-logo-blue.png\" --format md -o \"test_files/test_image_output.md\")",
+      "Bash(python scripts/parse_document_compare.py convert \"C:/Users/hspcadmin/Pictures/发票/结婚证.jpg\" --format md -o \"test_files/test_image_output.md\")",
+      "Bash(python scripts/parse_document_compare.py convert \"test_files/test.md\" --format md -o \"test_files/test_md_output.md\")",
+      "Bash(python scripts/parse_document_compare.py convert \"test_files/test.xml\" --format md -o \"test_files/test_xml_output.md\")"
+    ]
+  }
+}

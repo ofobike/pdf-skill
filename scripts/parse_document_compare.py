@@ -399,14 +399,42 @@ EXTENSION_FORMAT_MAP: dict[str, str] = {
     ".xls": "excel",
     ".html": "html",
     ".htm": "html",
+    # 文本格式
+    ".txt": "text",
+    ".csv": "text",
+    ".json": "text",
+    ".xml": "text",
+    ".md": "text",
+    ".markdown": "text",
+    # 图片格式
+    ".jpg": "image",
+    ".jpeg": "image",
+    ".png": "image",
+    ".gif": "image",
+    ".bmp": "image",
+    ".tiff": "image",
+    ".tif": "image",
+    ".webp": "image",
+    # 音频格式
+    ".mp3": "audio",
+    ".wav": "audio",
+    # 电子书
+    ".epub": "epub",
+    # 压缩包
+    ".zip": "archive",
 }
 
 FORMAT_PARSERS: dict[str, list[str]] = {
-    "pdf":   ["markitdown", "pymupdf", "pypdf", "pdfplumber", "pdfminer", "liteparse"],
-    "word":  ["markitdown", "python-docx"],
-    "ppt":   ["markitdown", "python-pptx"],
-    "excel": ["markitdown", "openpyxl"],
-    "html":  ["markitdown", "beautifulsoup4"],
+    "pdf":     ["markitdown", "pymupdf", "pypdf", "pdfplumber", "pdfminer", "liteparse", "opendataloader"],
+    "word":    ["markitdown", "python-docx"],
+    "ppt":     ["markitdown", "python-pptx"],
+    "excel":   ["markitdown", "openpyxl"],
+    "html":    ["markitdown", "beautifulsoup4"],
+    "text":    ["markitdown"],
+    "image":   ["markitdown"],
+    "audio":   ["markitdown"],
+    "epub":    ["markitdown"],
+    "archive": ["markitdown"],
 }
 
 
@@ -417,6 +445,7 @@ PARSER_MODULES: dict[str, list[str]] = {
     "pdfplumber": ["pdfplumber"],
     "pdfminer": ["pdfminer.high_level"],
     "liteparse": ["liteparse"],
+    "opendataloader": ["opendataloader_pdf"],
     "python-docx": ["docx"],
     "python-pptx": ["pptx"],
     "openpyxl": ["openpyxl"],
@@ -431,6 +460,7 @@ PARSER_PACKAGES: dict[str, str] = {
     "pdfplumber": "pdfplumber",
     "pdfminer": "pdfminer.six",
     "liteparse": "liteparse",
+    "opendataloader": "opendataloader-pdf",
     "python-docx": "python-docx",
     "python-pptx": "python-pptx",
     "openpyxl": "openpyxl",
@@ -456,6 +486,21 @@ OCR_DEPENDENCIES: list[dict[str, object]] = [
         "available": shutil.which("tesseract") is not None,
         "kind": "system",
         "package": "tesseract-ocr",
+    },
+]
+
+OPENLOADER_DEPENDENCIES: list[dict[str, object]] = [
+    {
+        "name": "opendataloader_pdf",
+        "available": module_exists("opendataloader_pdf"),
+        "kind": "python",
+        "package": "opendataloader-pdf",
+    },
+    {
+        "name": "java",
+        "available": shutil.which("java") is not None,
+        "kind": "system",
+        "package": "JDK/JRE (java command)",
     },
 ]
 
@@ -944,6 +989,50 @@ def _extract_pdf_liteparse(pdf_path: Path, start_page: int, max_pages: int | Non
     return "".join(parts)
 
 
+def _extract_pdf_opendataloader(pdf_path: Path, start_page: int, max_pages: int | None) -> str:
+    """使用 opendataloader-pdf（Java JAR）解析 PDF。"""
+    if not module_exists("opendataloader_pdf"):
+        raise ImportError("未安装 opendataloader-pdf，运行: pip install opendataloader-pdf（需要系统 Java 环境）")
+    from opendataloader_pdf import convert  # type: ignore
+
+    logger.info("opendataloader-pdf: 开始解析 %s (start_page=%s, max_pages=%s)", pdf_path.name, start_page, max_pages)
+
+    with tempfile.TemporaryDirectory(prefix="opendataloader_") as tmpdir:
+        # 构造页码范围参数
+        pages_spec = None
+        if max_pages is not None:
+            end_page = start_page + max_pages - 1
+            pages_spec = f"{start_page}-{end_page}"
+            logger.debug("opendataloader-pdf: 页码范围 %s", pages_spec)
+        elif start_page > 1:
+            pages_spec = f"{start_page}-"
+            logger.debug("opendataloader-pdf: 从第 %s 页到末尾", start_page)
+
+        try:
+            convert(
+                str(pdf_path),
+                output_dir=tmpdir,
+                format="text",
+                quiet=True,
+                **({"pages": pages_spec} if pages_spec else {}),
+            )
+        except Exception as e:
+            logger.error("opendataloader-pdf: 解析失败 - %s", e)
+            raise
+
+        # 读取输出文件（文件名包含原 PDF 名）
+        output_files = list(Path(tmpdir).glob("*.txt"))
+        if not output_files:
+            logger.warning("opendataloader-pdf: 未生成输出文件")
+            return ""
+
+        output_file = output_files[0]
+        logger.info("opendataloader-pdf: 输出文件 %s", output_file.name)
+        text = output_file.read_text(encoding="utf-8", errors="replace")
+        logger.info("opendataloader-pdf: 提取 %d 字符", len(text))
+        return text
+
+
 # ---------------------------------------------------------------------------
 # Word 解析器
 # ---------------------------------------------------------------------------
@@ -1098,6 +1187,91 @@ def _extract_html_bs4(file_path: Path, start_page: int, max_pages: int | None) -
 
 
 # ---------------------------------------------------------------------------
+# 文本格式解析器（TXT, CSV, JSON, XML, MD）
+# ---------------------------------------------------------------------------
+
+def _extract_text_markitdown(file_path: Path, start_page: int, max_pages: int | None) -> str:
+    """使用 markitdown 解析文本格式（TXT, CSV, JSON, XML, MD 等）。"""
+    if not module_exists("markitdown"):
+        raise ImportError("未安装 markitdown")
+    from markitdown import MarkItDown  # type: ignore
+
+    logger.info("markitdown: 解析文本文件 %s", file_path.name)
+    result = MarkItDown().convert(str(file_path))
+    text = getattr(result, "text_content", "") or ""
+    logger.info("markitdown: 提取 %d 字符", len(text))
+    return text
+
+
+# ---------------------------------------------------------------------------
+# 图片解析器（JPG, PNG, GIF, BMP, TIFF, WebP）
+# ---------------------------------------------------------------------------
+
+def _extract_image_markitdown(file_path: Path, start_page: int, max_pages: int | None) -> str:
+    """使用 markitdown 解析图片（EXIF 元数据 + OCR 文字识别）。"""
+    if not module_exists("markitdown"):
+        raise ImportError("未安装 markitdown")
+    from markitdown import MarkItDown  # type: ignore
+
+    logger.info("markitdown: 解析图片 %s (EXIF + OCR)", file_path.name)
+    result = MarkItDown().convert(str(file_path))
+    text = getattr(result, "text_content", "") or ""
+    logger.info("markitdown: 提取 %d 字符", len(text))
+    return text
+
+
+# ---------------------------------------------------------------------------
+# 音频解析器（MP3, WAV）
+# ---------------------------------------------------------------------------
+
+def _extract_audio_markitdown(file_path: Path, start_page: int, max_pages: int | None) -> str:
+    """使用 markitdown 解析音频（EXIF 元数据 + 语音转录）。"""
+    if not module_exists("markitdown"):
+        raise ImportError("未安装 markitdown")
+    from markitdown import MarkItDown  # type: ignore
+
+    logger.info("markitdown: 解析音频 %s (EXIF + 语音转录)", file_path.name)
+    result = MarkItDown().convert(str(file_path))
+    text = getattr(result, "text_content", "") or ""
+    logger.info("markitdown: 提取 %d 字符", len(text))
+    return text
+
+
+# ---------------------------------------------------------------------------
+# 电子书解析器（EPub）
+# ---------------------------------------------------------------------------
+
+def _extract_epub_markitdown(file_path: Path, start_page: int, max_pages: int | None) -> str:
+    """使用 markitdown 解析 EPub 电子书。"""
+    if not module_exists("markitdown"):
+        raise ImportError("未安装 markitdown")
+    from markitdown import MarkItDown  # type: ignore
+
+    logger.info("markitdown: 解析 EPub %s", file_path.name)
+    result = MarkItDown().convert(str(file_path))
+    text = getattr(result, "text_content", "") or ""
+    logger.info("markitdown: 提取 %d 字符", len(text))
+    return text
+
+
+# ---------------------------------------------------------------------------
+# 压缩包解析器（ZIP）
+# ---------------------------------------------------------------------------
+
+def _extract_archive_markitdown(file_path: Path, start_page: int, max_pages: int | None) -> str:
+    """使用 markitdown 解析 ZIP 压缩包（遍历内部内容）。"""
+    if not module_exists("markitdown"):
+        raise ImportError("未安装 markitdown")
+    from markitdown import MarkItDown  # type: ignore
+
+    logger.info("markitdown: 解析压缩包 %s (遍历内部文件)", file_path.name)
+    result = MarkItDown().convert(str(file_path))
+    text = getattr(result, "text_content", "") or ""
+    logger.info("markitdown: 提取 %d 字符", len(text))
+    return text
+
+
+# ---------------------------------------------------------------------------
 # 表格提取（PDF 专用）
 # ---------------------------------------------------------------------------
 
@@ -1184,6 +1358,7 @@ _EXTRACTORS: dict[tuple[str, str], Callable[[Path, int, int | None], str]] = {
     ("pdf", "pdfplumber"):   _extract_pdf_pdfplumber,
     ("pdf", "pdfminer"):     _extract_pdf_pdfminer,
     ("pdf", "liteparse"):    _extract_pdf_liteparse,
+    ("pdf", "opendataloader"): _extract_pdf_opendataloader,
     # Word
     ("word", "markitdown"):  _extract_word_markitdown,
     ("word", "python-docx"): _extract_word_docx,
@@ -1196,6 +1371,16 @@ _EXTRACTORS: dict[tuple[str, str], Callable[[Path, int, int | None], str]] = {
     # HTML
     ("html", "markitdown"):      _extract_html_markitdown,
     ("html", "beautifulsoup4"):  _extract_html_bs4,
+    # 文本格式 (TXT, CSV, JSON, XML, MD)
+    ("text", "markitdown"):  _extract_text_markitdown,
+    # 图片格式 (JPG, PNG, GIF, BMP, TIFF, WebP)
+    ("image", "markitdown"): _extract_image_markitdown,
+    # 音频格式 (MP3, WAV)
+    ("audio", "markitdown"): _extract_audio_markitdown,
+    # 电子书 (EPub)
+    ("epub", "markitdown"):  _extract_epub_markitdown,
+    # 压缩包 (ZIP)
+    ("archive", "markitdown"): _extract_archive_markitdown,
 }
 
 _PDF_PAGE_EXTRACTORS: dict[str, Callable[[Path, int, int | None], list[dict[str, object]]]] = {
@@ -1212,6 +1397,8 @@ _PARSER_ALIASES: dict[str, str] = {
     "pptx": "python-pptx",
     "bs4": "beautifulsoup4",
     "llama-parse": "liteparse",
+    "odl": "opendataloader",
+    "opendataloader-pdf": "opendataloader",
 }
 
 
@@ -1410,6 +1597,16 @@ def ocr_install_hint(missing_python: list[str], missing_system: list[str]) -> st
         hints.append(f"pip install {' '.join(missing_python)}")
     if missing_system:
         hints.append("install system Tesseract OCR")
+    return "; ".join(hints) if hints else None
+
+
+def opendataloader_install_hint(missing_python: list[str], missing_system: list[str]) -> str | None:
+    """Build a concise opendataloader-pdf install hint without empty commands."""
+    hints: list[str] = []
+    if missing_python:
+        hints.append(f"pip install {' '.join(missing_python)}")
+    if missing_system:
+        hints.append("install JDK/JRE and ensure java is in PATH")
     return "; ".join(hints) if hints else None
 
 
@@ -3471,6 +3668,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         for row in ocr_rows
         if not row["available"] and row["kind"] == "system"
     ]
+    opendataloader_rows = OPENLOADER_DEPENDENCIES if getattr(args, "opendataloader", False) else []
+    missing_opendataloader_python = [
+        str(row["package"])
+        for row in opendataloader_rows
+        if not row["available"] and row["kind"] == "python"
+    ]
+    missing_opendataloader_system = [
+        str(row["package"])
+        for row in opendataloader_rows
+        if not row["available"] and row["kind"] == "system"
+    ]
 
     if args.json:
         payload = {
@@ -3482,11 +3690,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "ocr_rows": ocr_rows,
             "missing_ocr_python_packages": missing_ocr_python,
             "missing_ocr_system_packages": missing_ocr_system,
+            "opendataloader_rows": opendataloader_rows,
+            "missing_opendataloader_python_packages": missing_opendataloader_python,
+            "missing_opendataloader_system_packages": missing_opendataloader_system,
             "install_command": f"pip install {' '.join(missing_packages)}" if missing_packages else None,
             "ocr_install_hint": ocr_install_hint(missing_ocr_python, missing_ocr_system),
+            "opendataloader_install_hint": opendataloader_install_hint(missing_opendataloader_python, missing_opendataloader_system),
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
-        strict_missing = missing_packages or missing_ocr_python or missing_ocr_system
+        strict_missing = missing_packages or missing_ocr_python or missing_ocr_system or missing_opendataloader_python or missing_opendataloader_system
         return 1 if strict_missing and args.strict else 0
 
     print(f"parse_pdf_compare {__version__}")
@@ -3518,7 +3730,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             if missing_ocr_system:
                 print("安装系统 Tesseract OCR，并确保 tesseract 在 PATH 中。")
 
-    if missing_packages or missing_ocr_python or missing_ocr_system:
+    if opendataloader_rows:
+        print("")
+        print("| opendataloader-pdf 依赖 | 类型 | 状态 | 安装包 |")
+        print("|---|---|---|---|")
+        for row in opendataloader_rows:
+            status = "ok" if row["available"] else "missing"
+            print(f"| {row['name']} | {row['kind']} | {status} | {row['package']} |")
+        if missing_opendataloader_python or missing_opendataloader_system:
+            print("")
+            print("opendataloader-pdf 依赖安装建议：")
+            if missing_opendataloader_python:
+                print(f"pip install {' '.join(missing_opendataloader_python)}")
+            if missing_opendataloader_system:
+                print("需要系统安装 Java (JDK/JRE)，并确保 java 命令在 PATH 中。")
+
+    if missing_packages or missing_ocr_python or missing_ocr_system or missing_opendataloader_python or missing_opendataloader_system:
         return 1 if args.strict else 0
 
     print("")
@@ -4244,6 +4471,7 @@ def build_parser() -> argparse.ArgumentParser:
                           help="只检查某一类格式")
     p_doctor.add_argument("--json", action="store_true", help="输出 JSON")
     p_doctor.add_argument("--ocr", action="store_true", help="同时检查 OCR 可选依赖")
+    p_doctor.add_argument("--opendataloader", action="store_true", help="同时检查 opendataloader-pdf 依赖（需要 Java）")
     p_doctor.add_argument("--strict", action="store_true",
                           help="存在缺失依赖时返回非零退出码")
 

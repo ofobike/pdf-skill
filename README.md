@@ -1,16 +1,23 @@
-# 多格式文档解析对比 Skill
+# Document Skill - 多格式文档智能解析工具
 
 这是一个可发布的 Codex skill，也可以作为独立命令行工具使用。它用于对同一个文档运行多个解析器，比较文本抽取质量，并帮助判断是否需要 OCR 或更干净的源文件。
+
+支持格式：PDF、Word、PPT、Excel、HTML、TXT、CSV、JSON、XML、图片、音频、EPub、ZIP。
 
 ## 能力
 
 | 格式 | 扩展名 | 解析器 |
 |---|---|---|
-| PDF | `.pdf` | `markitdown`, `pymupdf`, `pypdf`, `pdfplumber`, `pdfminer`, `liteparse` |
-| Word | `.docx` | `markitdown`, `python-docx` |
-| PPT | `.pptx` | `markitdown`, `python-pptx` |
-| Excel | `.xlsx` | `markitdown`, `openpyxl` |
+| PDF | `.pdf` | `markitdown`, `pymupdf`, `pypdf`, `pdfplumber`, `pdfminer`, `liteparse`, `opendataloader` (需 Java) |
+| Word | `.docx`, `.doc` | `markitdown`, `python-docx` |
+| PPT | `.pptx`, `.ppt` | `markitdown`, `python-pptx` |
+| Excel | `.xlsx`, `.xls` | `markitdown`, `openpyxl` |
 | HTML | `.html`, `.htm` | `markitdown`, `beautifulsoup4` |
+| 文本 | `.txt`, `.csv`, `.json`, `.xml`, `.md` | `markitdown` |
+| 图片 | `.jpg`, `.png`, `.gif`, `.bmp`, `.tiff`, `.webp` | `markitdown` (EXIF + OCR，需 Tesseract) |
+| 音频 | `.mp3`, `.wav` | `markitdown` (EXIF + 语音转录，需 whisper) |
+| 电子书 | `.epub` | `markitdown` |
+| 压缩包 | `.zip` | `markitdown` (遍历内部文件) |
 
 主要命令：
 
@@ -60,73 +67,73 @@ pdf-skill/
 Codex 显式触发：
 
 ```text
-$document-parse-compare
+$document-skill
 ```
 
 对话示例：
 
 ```text
-使用 $document-parse-compare 对比这个 PDF 的解析质量，并推荐最佳解析器。
+使用 $document-skill 对比这个 PDF 的解析质量，并推荐最佳解析器。
 ```
 
 ```text
-使用 $document-parse-compare，把 D:\documents\report.pdf 用 pymupdf 解析成 json。
+使用 $document-skill，把 D:\documents\report.pdf 用 pymupdf 解析成 json。
 ```
 
 ```text
-使用 $document-parse-compare，提取这个 PDF 的 metadata，并判断是否有文本层。
+使用 $document-skill，提取这个 PDF 的 metadata，并判断是否有文本层。
 ```
 
 ```text
-使用 $document-parse-compare，把这个 PDF 按 2000 字分块输出 jsonl。
+使用 $document-skill，把这个 PDF 按 2000 字分块输出 jsonl。
 ```
 
 ```text
-使用 $document-parse-compare，把这个 PDF 按页分块输出 jsonl，保留页码。
+使用 $document-skill，把这个 PDF 按页分块输出 jsonl，保留页码。
 ```
 
 ```text
-使用 $document-parse-compare，扫描 D:\documents 目录里的 PDF，质量低于 0.6 就失败。
+使用 $document-skill，扫描 D:\documents 目录里的 PDF，质量低于 0.6 就失败。
 ```
 
 ```text
-使用 $document-parse-compare，把这个 PDF 的第 1-3 页渲染成图片。
+使用 $document-skill，把这个 PDF 的第 1-3 页渲染成图片。
 ```
 
 ```text
-使用 $document-parse-compare，对这个 PDF 第 1 页做 OCR，输出 Markdown。
+使用 $document-skill，对这个 PDF 第 1 页做 OCR，输出 Markdown。
 ```
 
 ```text
-使用 $document-parse-compare，自动解析这个 PDF，判断类型并输出最佳文本和字段。
+使用 $document-skill，自动解析这个 PDF，判断类型并输出最佳文本和字段。
 ```
 
 ```text
-使用 $document-parse-compare，抽取这张发票的结构化字段，输出 JSON。
+使用 $document-skill，抽取这张发票的结构化字段，输出 JSON。
 ```
 
 ```text
-使用 $document-parse-compare，把这个目录里的发票汇总导出 Excel。
+使用 $document-skill，把这个目录里的发票汇总导出 Excel。
 ```
 
 ```text
-使用 $document-parse-compare，自动解析这个 PDF，质量差就 OCR，并输出 layout。
+使用 $document-skill，自动解析这个 PDF，质量差就 OCR，并输出 layout。
 ```
 
 ```text
-使用 $document-parse-compare，校验这个发票字段 JSON 是否金额一致。
+使用 $document-skill，校验这个发票字段 JSON 是否金额一致。
 ```
 
 ```text
-使用 $document-parse-compare，识别这个文档类型并推荐处理策略。
+使用 $document-skill，识别这个文档类型并推荐处理策略。
 ```
 
 ```text
-使用 $document-parse-compare，为这个 PDF 生成可追溯知识包，后面做 RAG。
+使用 $document-skill，为这个 PDF 生成可追溯知识包，后面做 RAG。
 ```
 
 ```text
-使用 $document-parse-compare，检查 PDF 解析器依赖是否都安装。
+使用 $document-skill，检查 PDF 解析器依赖是否都安装。
 ```
 
 自然语言也可以触发，例如：
@@ -153,7 +160,7 @@ $document-parse-compare
 - “生成 RAG 知识包”
 - “批量生产知识库材料”
 
-注意：`/pdf-compare` 是 Claude Code 兼容方式；Codex 标准触发用 `$document-parse-compare`。
+注意：`/pdf-compare` 是 Claude Code 兼容方式；Codex 标准触发用 `$document-skill`。
 
 ## 使用
 
@@ -312,11 +319,14 @@ pip install -r requirements.txt
 
 ```powershell
 pip install markitdown pymupdf pypdf pdfplumber pdfminer.six liteparse
+pip install opendataloader-pdf  # 需要系统安装 Java
 pip install python-docx python-pptx openpyxl beautifulsoup4
 pip install pytesseract pillow
 ```
 
 缺失的解析器会在报告中跳过，不会导致整个对比任务失败。
+
+**opendataloader-pdf 特别说明**：该解析器基于 Java JAR，`pip install` 会安装 Python 包装器和 JAR 文件，但运行时需要系统有 `java` 命令（JDK/JRE）。
 
 OCR 的系统 Tesseract 需要单独安装；仅安装 Python 包还不能完成真正 OCR。
 
