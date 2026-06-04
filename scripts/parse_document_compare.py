@@ -1596,7 +1596,7 @@ def ocr_install_hint(missing_python: list[str], missing_system: list[str]) -> st
     if missing_python:
         hints.append(f"pip install {' '.join(missing_python)}")
     if missing_system:
-        hints.append("install system Tesseract OCR")
+        hints.append("install system Tesseract OCR, add tesseract to PATH, and install requested language data such as chi_sim")
     return "; ".join(hints) if hints else None
 
 
@@ -1606,7 +1606,7 @@ def opendataloader_install_hint(missing_python: list[str], missing_system: list[
     if missing_python:
         hints.append(f"pip install {' '.join(missing_python)}")
     if missing_system:
-        hints.append("install JDK/JRE and ensure java is in PATH")
+        hints.append("install Java JDK/JRE and ensure java is on PATH")
     return "; ".join(hints) if hints else None
 
 
@@ -3728,7 +3728,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             if missing_ocr_python:
                 print(f"pip install {' '.join(missing_ocr_python)}")
             if missing_ocr_system:
-                print("安装系统 Tesseract OCR，并确保 tesseract 在 PATH 中。")
+                print("安装系统 Tesseract OCR，并确保 tesseract 在 PATH 中；中文 OCR 还需要 chi_sim 等语言数据。")
 
     if opendataloader_rows:
         print("")
@@ -4386,6 +4386,93 @@ def cmd_batch_knowledge(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# 子命令：qa（本地抽取式问答）
+# ---------------------------------------------------------------------------
+
+def cmd_qa(args: argparse.Namespace) -> int:
+    source = args.source.resolve()
+    if not source.exists():
+        print(f"错误：输入不存在：{source}", file=sys.stderr)
+        return 1
+
+    max_pages = None if args.max_pages == 0 else args.max_pages
+    if args.output:
+        out_path = Path(args.output).resolve()
+    elif args.format == "all":
+        out_path = source.parent / f"{source.stem}_qa"
+    else:
+        out_path = source.parent / f"{source.stem}_qa.{args.format}"
+
+    try:
+        payload = build_qa_payload(
+            source,
+            args.question,
+            args.parser,
+            args.start_page,
+            max_pages,
+            args.chunk_by,
+            args.chunk_size,
+            args.overlap,
+            args.top_k,
+            args.answer_sentences,
+        )
+        written = write_qa_output(payload, out_path, args.format)
+    except Exception as exc:
+        print(f"错误：qa 失败：{exc}", file=sys.stderr)
+        return 1
+
+    answer = payload.get("answer") if isinstance(payload.get("answer"), dict) else {}
+    print(f"状态：{answer.get('status')}")
+    print(f"输出：{', '.join(str(path) for path in written)}")
+    return 0 if answer.get("status") == "found" else 2
+
+
+# ---------------------------------------------------------------------------
+# 子命令：diff-docs（文档版本差异对比）
+# ---------------------------------------------------------------------------
+
+def cmd_diff_docs(args: argparse.Namespace) -> int:
+    left_path = args.left.resolve()
+    right_path = args.right.resolve()
+    if not left_path.exists():
+        print(f"错误：左侧文件不存在：{left_path}", file=sys.stderr)
+        return 1
+    if not right_path.exists():
+        print(f"错误：右侧文件不存在：{right_path}", file=sys.stderr)
+        return 1
+
+    max_pages = None if args.max_pages == 0 else args.max_pages
+    if args.output:
+        out_path = Path(args.output).resolve()
+    elif args.format == "all":
+        out_path = left_path.parent / f"{left_path.stem}_vs_{right_path.stem}_diff"
+    else:
+        out_path = left_path.parent / f"{left_path.stem}_vs_{right_path.stem}_diff.{args.format}"
+
+    try:
+        payload = build_diff_payload(
+            left_path,
+            right_path,
+            args.parser,
+            args.start_page,
+            max_pages,
+            args.profile,
+            args.max_diff_lines,
+        )
+        written = write_diff_output(payload, out_path, args.format)
+    except Exception as exc:
+        print(f"错误：diff-docs 失败：{exc}", file=sys.stderr)
+        return 1
+
+    line_diff = payload.get("line_diff") if isinstance(payload.get("line_diff"), dict) else {}
+    similarity = payload.get("similarity") if isinstance(payload.get("similarity"), dict) else {}
+    print(f"相似度：{similarity.get('full_text_ratio')}")
+    print(f"变更块：{line_diff.get('changed_block_count')}")
+    print(f"输出：{', '.join(str(path) for path in written)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -4606,6 +4693,33 @@ def build_parser() -> argparse.ArgumentParser:
     p_batch_pack.add_argument("--overlap", type=int, default=200, help="字符分块重叠。默认 200")
     p_batch_pack.add_argument("--min-quality", type=float, default=0.5, help="最低质量评分门槛，默认 0.5")
 
+    # --- qa ---
+    p_qa = subparsers.add_parser("qa", help="基于知识包、chunks 或文档执行本地抽取式问答")
+    p_qa.add_argument("source", type=Path, help="知识包目录、chunks.jsonl/json 或文档路径")
+    p_qa.add_argument("question", help="问题")
+    p_qa.add_argument("--parser", default="auto", help="直接输入文档时使用的解析器，默认 auto")
+    p_qa.add_argument("--max-pages", type=int, default=30, help="直接输入文档时前 N 页，0=全量。默认 30")
+    p_qa.add_argument("--start-page", type=int, default=1, help="直接输入 PDF 时起始页。默认 1")
+    p_qa.add_argument("--chunk-by", choices=["char", "page"], default="page", help="直接输入 PDF 时分块方式，默认 page")
+    p_qa.add_argument("--chunk-size", type=int, default=2000, help="字符分块大小。默认 2000")
+    p_qa.add_argument("--overlap", type=int, default=200, help="字符分块重叠。默认 200")
+    p_qa.add_argument("--top-k", type=int, default=5, help="检索候选块数量。默认 5")
+    p_qa.add_argument("--answer-sentences", type=int, default=5, help="最多输出答案句数。默认 5")
+    p_qa.add_argument("--format", choices=["json", "md", "all"], default="md", help="输出格式。默认 md")
+    p_qa.add_argument("-o", "--output", default=None, help="输出文件路径；--format all 时为输出目录")
+
+    # --- diff-docs ---
+    p_diff = subparsers.add_parser("diff-docs", help="对比两个文档版本的文本、分类和可选发票字段差异")
+    p_diff.add_argument("left", type=Path, help="左侧/旧版本文档")
+    p_diff.add_argument("right", type=Path, help="右侧/新版本文档")
+    p_diff.add_argument("--parser", default="auto", help="解析器，默认 auto")
+    p_diff.add_argument("--max-pages", type=int, default=30, help="前 N 页，0=全量。默认 30")
+    p_diff.add_argument("--start-page", type=int, default=1, help="起始页。默认 1")
+    p_diff.add_argument("--profile", choices=["auto", "invoice", "none"], default="auto", help="结构化字段差异 profile。默认 auto")
+    p_diff.add_argument("--max-diff-lines", type=int, default=200, help="最多输出 unified diff 行数。默认 200")
+    p_diff.add_argument("--format", choices=["json", "md", "all"], default="md", help="输出格式。默认 md")
+    p_diff.add_argument("-o", "--output", default=None, help="输出文件路径；--format all 时为输出目录")
+
     return parser
 
 
@@ -4617,6 +4731,7 @@ def main() -> int:
         "compare", "convert", "batch", "scan-dir", "tables", "doctor", "metadata",
         "chunk", "render-pages", "ocr", "auto", "extract-fields", "export-xlsx",
         "layout-json", "verify-fields", "classify", "knowledge-pack", "batch-knowledge",
+        "qa", "diff-docs",
         "--version", "-h", "--help",
     ):
         sys.argv.insert(1, "compare")
@@ -4646,6 +4761,8 @@ def main() -> int:
         "classify": cmd_classify,
         "knowledge-pack": cmd_knowledge_pack,
         "batch-knowledge": cmd_batch_knowledge,
+        "qa": cmd_qa,
+        "diff-docs": cmd_diff_docs,
     }
 
     handler = dispatch.get(args.command)

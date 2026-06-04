@@ -1,8 +1,17 @@
-# Document Parse Compare Roadmap
+# PDF Parse Skill Roadmap
 
-This project is evolving from a parser comparison helper into a document intelligence skill.
+This project is evolving from a PDF parser comparison helper into a PDF-first document intelligence skill.
 
 ## Version Priorities
+
+### v4.1 - Skill Usability And Progressive Disclosure
+
+Goal: make the skill easier for Codex to trigger correctly and cheaper to load.
+
+- Done in `4.1.0`: renamed the Codex-facing skill trigger to `pdf-parse-skill`.
+- Done in `4.1.0`: reduced `SKILL.md` to workflow, command selection, and OCR quality rules.
+- Done in `4.1.0`: moved detailed command examples and output descriptions to `references/command-guide.md`.
+- Done in `4.1.0`: expanded dependency guidance for Tesseract OCR, Chinese OCR language data, `opendataloader-pdf`, and Java.
 
 ### v3.6 - Smart Extraction Foundation
 
@@ -29,8 +38,8 @@ Goal: produce reusable knowledge and business-data packages.
 - Done in `4.0.0`: `classify` detects invoice, contract, textbook, notice, scanned/image PDFs, and generic documents with strategy hints.
 - Done in `4.0.0`: `knowledge-pack` generates chunks, metadata, manifest, quality report, layout, source text, and page map.
 - Done in `4.0.0`: `batch-knowledge` produces knowledge packs for a whole directory.
-- Future: `qa` answers questions from extracted content with page-level source references.
-- Future: `diff-docs` compares two document versions and reports semantic and field-level changes.
+- Done in `4.1.0`: `qa` exposes local extractive QA over knowledge packs, chunks files, or documents.
+- Done in `4.1.0`: `diff-docs` compares two document versions by extracted text, line diff, classification, and invoice fields when applicable.
 
 ## Design Rules
 

@@ -1,4 +1,4 @@
 interface:
-  display_name: "Document Parse Compare"
-  short_description: "Document intelligence: parse, classify, OCR, extract, verify, and pack"
-  default_prompt: "Use $document-parse-compare to classify this document, choose the best extraction strategy, and produce traceable outputs or structured fields."
+  display_name: "PDF Parse Skill"
+  short_description: "PDF parsing, OCR routing, extraction, and RAG packs"
+  default_prompt: "Use $pdf-parse-skill to compare this PDF's extraction quality, choose the best strategy, and produce traceable outputs."

@@ -1,10 +1,10 @@
 ---
 description: >
-  Document Skill - 多格式文档智能解析工具：对比解析器、文档转 Markdown、批量转换、表格提取。
+  Document Intelligence Skill - 多格式文档智能解析工具：对比解析器、文档转 Markdown、批量转换、表格提取。
   支持格式：PDF、Word、PPT、Excel、HTML、TXT、CSV、JSON、XML、图片、音频、EPub、ZIP。
   触发条件：用户要求"对比解析器"、"测试文档提取"、"比较解析库"、"文档转 Markdown"、
   "批量转换 PDF"、"提取 PDF 表格"、"解析文档"、"转换格式"。
-  用法：/document-skill compare|convert|batch|tables|auto <文件> [选项]
+  用法：/document-intelligence-skill compare|convert|batch|tables|auto <文件> [选项]
   跳过：单纯的文档阅读、文档创建、与解析无关的操作。
 ---
 
