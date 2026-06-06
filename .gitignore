@@ -8,3 +8,4 @@ dist/
 build/
 *_parse_output/
 *_parse_compare/
+outputs/

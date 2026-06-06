@@ -1,6 +1,6 @@
 ---
 name: pdf-parse-skill
-description: PDF-first local document parsing and extraction skill. Use when Codex needs to compare PDF text extraction quality, diagnose `(cid:...)`, blank, garbled, scanned, or low-quality PDF output, decide whether OCR or a cleaner source is needed, convert local documents to Markdown/TXT/JSON, run parser voting with OCR, extract/vote PDF tables, extract layout coordinates, render PDF pages, run optional Tesseract OCR, chunk extracted text for indexing/RAG, classify documents, build customer packs or traceable knowledge packs, or extract/verify/export invoice fields with field-level confidence. Also supports DOCX, PPTX, XLSX, HTML, text-like files, images, audio, EPub, and ZIP through the bundled parser script when the request is about parsing, conversion, quality gates, or structured extraction.
+description: PDF-first local document parsing and extraction skill. Use when Codex needs to compare PDF text extraction quality, diagnose `(cid:...)`, blank, garbled, scanned, or low-quality PDF output, decide whether OCR or a cleaner source is needed, convert local documents to Markdown/TXT/JSON, run parser voting with OCR, extract/vote PDF tables, extract layout coordinates, render PDF pages, run optional Tesseract OCR, chunk extracted text for indexing/RAG, classify documents, build customer packs or traceable knowledge packs, run golden PDF regression evaluation, or extract/verify/export invoice fields with field-level confidence, field-level parser fusion, and optional field bbox traceability. Also supports DOCX, PPTX, XLSX, HTML, text-like files, images, audio, EPub, and ZIP through the bundled parser script when the request is about parsing, conversion, quality gates, or structured extraction.
 ---
 
 # PDF Parse Skill
@@ -33,7 +33,7 @@ Use this skill as `$pdf-parse-skill`. Claude-style `/pdf-compare` references are
 - User asks to include OCR in parser voting: include `ocr-tesseract` in `--parsers` for `probe`, `vote`, or `customer-pack`; do not treat OCR only as a last fallback.
 - User asks for a customer-ready package for a complex PDF with tables, company data, layout, or source traceability: use `customer-pack`; provide `manifest.json`, `README.md`, `best.md/txt/json`, `tables/table_vote_report.md/json`, `tables/best_tables.md/csv/json`, `layout.json`, `metadata.json`, `vote_report.md/json`, and preflight `probe_report.md/json`.
 - User asks to process a directory of customer PDFs: use `batch-customer-pack`; provide `index.json/index.md` and the per-file package paths.
-- User asks for the most reliable invoice PDF result for a customer: use `vote --probe-before-vote --profile invoice --customer --format all`; provide `customer_best.md/txt/json`, `best.md/txt/json`, `vote_report.md/json`, and `preflight_probe/probe_report.md/json`.
+- User asks for the most reliable invoice PDF result for a customer: use `vote --probe-before-vote --profile invoice --customer --format all`; field-level fusion is enabled by default, and add `--field-layout` when field page/bbox traceability is requested. Provide `customer_best.md/txt/json`, `best.md/txt/json`, `vote_report.md/json`, optional `field_layout.json`, and `preflight_probe/probe_report.md/json`.
 - User asks for PDF-to-Markdown optimized for LLM/RAG: prefer `convert --parser pymupdf4llm`; try `docling` for heavier structure-aware conversion; try `pspdfkit` only when the external `pdf-to-markdown` CLI is installed.
 - User asks for Markdown/TXT/JSON: use `convert`.
 - User asks to process a folder: use `scan-dir` first for quality, then `batch`, `batch-knowledge`, or `batch-customer-pack` depending on the requested deliverable.
@@ -43,7 +43,8 @@ Use this skill as `$pdf-parse-skill`. Claude-style `/pdf-compare` references are
 - User asks for RAG/indexing chunks: use `chunk`; use `--chunk-by page` when page traceability matters.
 - User asks to inspect pages visually or prepare OCR inputs: use `render-pages`.
 - User explicitly asks for OCR or extraction is clearly image/scanned: check dependencies, then use `ocr` or `auto --auto-ocr`.
-- User asks for coordinates, page maps, or source traceability: use `layout-json` or `knowledge-pack`.
+- User asks for coordinates, page maps, or source traceability: use `layout-json`, `knowledge-pack`, or `customer-pack`; for invoice field-level bbox use `vote --customer --field-layout` or `customer-pack`.
+- User asks whether parser changes regressed, wants a golden set, regression testing, or stable customer acceptance checks: use `eval-golden` with case JSON files.
 - User asks questions over an existing knowledge pack, chunks file, or parsed document: use `qa`.
 - User asks to compare two document versions: use `diff-docs`.
 - User asks for invoice fields or invoice summaries: use `extract-fields --profile invoice`, `verify-fields --profile invoice`, or `export-xlsx --profile invoice`.
@@ -56,7 +57,8 @@ Use this skill as `$pdf-parse-skill`. Claude-style `/pdf-compare` references are
 - In `vote`, repeated lines/spans reduce the score so duplicated parser output does not win only by text length.
 - In `vote --probe-before-vote`, run a real-file sample probe first and only send `ready` parsers into the final vote.
 - In `vote --profile invoice`, invoice field completeness, validation status, amount/tax checks, and duplicate line-item checks are included in the score.
-- In `vote --profile invoice --customer`, customer outputs include field-level confidence with source parser, support count, estimated page, bbox placeholder, and confidence.
+- In `vote --profile invoice --customer`, customer outputs use field-level parser fusion by default: each invoice field can come from the strongest parser candidate, then invoice validation is rerun. If fusion would make validation worse than the whole-document winner, it is not used. Use `--no-field-fusion` to disable it.
+- Customer invoice outputs include field-level confidence with source parser, support count, page, bbox, source location, and confidence. Bbox is filled when `--field-layout` or `customer-pack` layout matching can locate the value; otherwise it remains `null`.
 - `ocr-tesseract` is a PDF parser candidate for voting and probing when OCR dependencies are available.
 - `table-vote` scores table density, row/column consistency, header completeness, coverage, and cross-method consensus.
 - Use `--timeout` for heavy parsers such as `docling`, OCR, or external CLIs when the user cares about finishing reliably.

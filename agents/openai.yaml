@@ -1,4 +1,4 @@
 interface:
   display_name: "PDF Parse Skill"
-  short_description: "PDF parsing, OCR routing, extraction, and RAG packs"
-  default_prompt: "Use $pdf-parse-skill to compare this PDF's extraction quality, choose the best strategy, and produce traceable outputs."
+  short_description: "PDF parsing, voting, OCR, field fusion, traceability, and RAG packs"
+  default_prompt: "Use $pdf-parse-skill to compare this PDF's extraction quality, choose the best strategy, and produce traceable customer-ready outputs."

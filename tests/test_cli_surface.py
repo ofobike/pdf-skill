@@ -51,6 +51,7 @@ class CliSurfaceTest(unittest.TestCase):
             "scan-dir",
             "tables",
             "table-vote",
+            "eval-golden",
             "doctor",
             "metadata",
             "chunk",
@@ -82,9 +83,31 @@ class CliSurfaceTest(unittest.TestCase):
 
         self.assertIn("profile", option_dests)
         self.assertIn("customer", option_dests)
+        self.assertIn("no_field_fusion", option_dests)
+        self.assertIn("field_layout", option_dests)
+        self.assertIn("field_layout_max_pages", option_dests)
         self.assertIn("probe_before_vote", option_dests)
         self.assertIn("probe_max_pages", option_dests)
         self.assertIn("probe_min_quality", option_dests)
+        self.assertIn("timeout", option_dests)
+        self.assertIn("parser_health_cache", option_dests)
+
+    def test_eval_golden_command_exposes_regression_options(self):
+        module = load_module()
+        parser = module.build_parser()
+        subparsers_action = next(
+            action
+            for action in parser._actions
+            if getattr(action, "dest", None) == "command"
+        )
+        eval_parser = subparsers_action.choices["eval-golden"]
+        option_dests = {action.dest for action in eval_parser._actions}
+
+        self.assertIn("path", option_dests)
+        self.assertIn("recursive", option_dests)
+        self.assertIn("max_pages", option_dests)
+        self.assertIn("parsers", option_dests)
+        self.assertIn("profile", option_dests)
         self.assertIn("timeout", option_dests)
         self.assertIn("parser_health_cache", option_dests)
         self.assertIn("health_cache", option_dests)
@@ -104,6 +127,7 @@ class CliSurfaceTest(unittest.TestCase):
         self.assertIn("layout_max_pages", option_dests)
         self.assertIn("no_tables", option_dests)
         self.assertIn("no_layout", option_dests)
+        self.assertIn("no_field_fusion", option_dests)
         self.assertIn("profile", option_dests)
         self.assertIn("timeout", option_dests)
         self.assertIn("parser_health_cache", option_dests)
@@ -128,6 +152,7 @@ class CliSurfaceTest(unittest.TestCase):
         self.assertIn("table_pages", batch_dests)
         self.assertIn("timeout", batch_dests)
         self.assertIn("parser_health_cache", batch_dests)
+        self.assertIn("no_field_fusion", batch_dests)
 
     def test_pdf_parser_registry_includes_markdown_parsers(self):
         module = load_module()
@@ -397,6 +422,169 @@ class CliSurfaceTest(unittest.TestCase):
         self.assertIn("field_confidence", customer_json)
         self.assertGreater(customer_json["field_confidence"]["invoice_number"]["confidence"], 0)
         self.assertEqual(customer_json["field_confidence"]["invoice_number"]["source_parser"], "clean_invoice")
+
+    def test_field_confidence_uses_layout_bbox_when_available(self):
+        module = load_module()
+        payload = {
+            "winner": {"parser": "clean_invoice"},
+            "votes": [
+                {
+                    "parser": "clean_invoice",
+                    "eligible": True,
+                    "invoice_fields": {
+                        "invoice_number": "123456789012",
+                        "total_with_tax": 113.00,
+                    },
+                }
+            ],
+        }
+        layout = {
+            "pages": [
+                {
+                    "page": 1,
+                    "blocks": [
+                        {
+                            "block_id": 1,
+                            "lines": [
+                                {
+                                    "line_id": 1,
+                                    "text": "发票号码:123456789012",
+                                    "bbox": [10, 20, 150, 35],
+                                    "spans": [
+                                        {
+                                            "span_id": 1,
+                                            "text": "发票号码:123456789012",
+                                            "bbox": [10, 20, 150, 35],
+                                        }
+                                    ],
+                                },
+                                {
+                                    "line_id": 2,
+                                    "text": "价税合计(小写)¥113.00",
+                                    "bbox": [10, 80, 180, 95],
+                                    "spans": [
+                                        {
+                                            "span_id": 1,
+                                            "text": "价税合计(小写)¥113.00",
+                                            "bbox": [10, 80, 180, 95],
+                                        }
+                                    ],
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+
+        confidence = module.build_field_confidence(payload, {"clean_invoice": ""}, layout)
+
+        self.assertEqual(confidence["invoice_number"]["page"], 1)
+        self.assertEqual(confidence["invoice_number"]["bbox"], [10.0, 20.0, 150.0, 35.0])
+        self.assertEqual(confidence["invoice_number"]["location"]["match_type"], "span_contains")
+        self.assertEqual(confidence["total_with_tax"]["bbox"], [10.0, 80.0, 180.0, 95.0])
+
+    def test_invoice_customer_delivery_can_fuse_fields_across_parsers(self):
+        module = load_module()
+        winner_fields = {
+            "invoice_type": "电子发票（普通发票）",
+            "invoice_number": "123456789012",
+            "invoice_date": "2026年06月05日",
+            "buyer_name": "测试买方公司",
+            "buyer_tax_id": "91330100MA1234567A",
+            "seller_name": "测试销售公司",
+            "seller_tax_id": "91440100MA7654321B",
+            "total_amount": 100.0,
+            "total_tax": 13.0,
+            "total_with_tax": 113.0,
+            "total_with_tax_cn": "壹佰壹拾叁元整",
+            "drawer": "张三",
+            "items": [
+                {
+                    "name": "*信息技术服务*软件服务",
+                    "unit": "项",
+                    "quantity": 1.0,
+                    "unit_price": 100.0,
+                    "amount": 100.0,
+                    "tax_rate": "13%",
+                    "tax_amount": 13.0,
+                }
+            ],
+        }
+        winner_fields["validation"] = module.validate_invoice_fields(winner_fields, strict=True)
+        alternate_fields = dict(winner_fields)
+        alternate_fields["buyer_name"] = "测试买方有限公司"
+        alternate_fields["validation"] = module.validate_invoice_fields(alternate_fields, strict=True)
+        payload = {
+            "source_file": "invoice.pdf",
+            "profile": {"resolved": "invoice"},
+            "weights": {},
+            "winner": {
+                "parser": "winner_parser",
+                "vote_score": 0.8,
+                "invoice_score": 0.8,
+                "quality_score": 0.8,
+                "quality_label": "high",
+                "invoice_fields": winner_fields,
+            },
+            "votes": [
+                {
+                    "parser": "winner_parser",
+                    "eligible": True,
+                    "vote_score": 0.8,
+                    "invoice_score": 0.8,
+                    "quality_score": 0.8,
+                    "invoice_fields": winner_fields,
+                },
+                {
+                    "parser": "alternate_parser",
+                    "eligible": True,
+                    "vote_score": 0.95,
+                    "invoice_score": 0.95,
+                    "quality_score": 0.95,
+                    "invoice_fields": alternate_fields,
+                },
+            ],
+        }
+
+        delivery = module.build_customer_invoice_delivery(payload, {}, None, field_fusion=True)
+
+        self.assertEqual(delivery["parser"], "field-fusion")
+        self.assertEqual(delivery["base_parser"], "winner_parser")
+        self.assertEqual(delivery["invoice"]["buyer_name"], "测试买方有限公司")
+        self.assertTrue(delivery["audit"]["field_fusion"]["used"])
+        self.assertIn("buyer_name", delivery["audit"]["field_fusion"]["changed_fields"])
+
+    def test_vote_expectations_compare_invoice_fields(self):
+        module = load_module()
+        payload = {
+            "winner": {
+                "parser": "clean_invoice",
+                "vote_score": 0.91,
+                "invoice_fields": {
+                    "invoice_number": "123456789012",
+                    "buyer_name": "测试买方公司",
+                    "validation": {"status": "ok"},
+                },
+            },
+            "profile": {"resolved": "invoice"},
+            "quality_gate": {"passed": True},
+        }
+        expected = {
+            "winner_parser": "clean_invoice",
+            "profile_resolved": "invoice",
+            "min_vote_score": 0.9,
+            "validation_status": "ok",
+            "fields": {
+                "invoice_number": "123456789012",
+                "buyer_name": {"contains": "买方"},
+            },
+        }
+
+        evaluation = module.evaluate_vote_expectations(payload, expected)
+
+        self.assertTrue(evaluation["passed"])
+        self.assertEqual(evaluation["check_count"], 6)
 
     def test_qa_over_chunks_jsonl(self):
         module = load_module()
