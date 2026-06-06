@@ -7,6 +7,11 @@ pypdf
 pdfplumber
 pdfminer.six
 liteparse
+# 可选：面向 LLM/RAG 的 Markdown 或结构化 PDF 解析
+pymupdf4llm
+docling
+# 可选：PSPDFKit/Nutrient PDF to Markdown 是外部 Node CLI，不是 Python 包：
+# npm install -g @pspdfkit/pdf-to-markdown
 
 # Word 解析
 python-docx

@@ -17,10 +17,15 @@ Current exposed commands:
 | Command | Use |
 |---|---|
 | `compare` | Run multiple parsers against one file and create quality reports. |
+| `vote` | Run multiple PDF parsers, vote by quality/consensus/coverage/structure/repetition, and write best output. Supports invoice-weighted customer delivery, OCR parser voting, optional preflight parser probing, timeout, and parser health cache. |
+| `customer-pack` | Build a customer-ready PDF package with best text, optional customer fields, table voting, layout, metadata, manifest, vote report, and preflight report. |
+| `batch-customer-pack` | Build customer-ready PDF packages for a directory and write `index.json/index.md`. |
+| `probe` | Run real extraction smoke tests for registered parsers and report runtime readiness. |
 | `convert` | Convert one file to `md`, `txt`, `json`, or `all`. |
 | `batch` | Convert matching files in a directory. |
 | `scan-dir` | Scan a directory for extraction quality and optional quality gates. |
 | `tables` | Extract PDF tables to `md`, `csv`, `json`, or `all`. |
+| `table-vote` | Run multiple table extractors and vote on the best table output. |
 | `doctor` | Check parser, OCR, and opendataloader dependency availability. |
 | `metadata` | Extract metadata; PDFs include page count, embedded metadata, TOC preview, and text-layer hints. |
 | `chunk` | Split extracted text into `jsonl`, `json`, `md`, `txt`, or `all` by character or PDF page. |
@@ -43,7 +48,7 @@ Current exposed commands:
 
 | Format | Extensions | Parsers |
 |---|---|---|
-| PDF | `.pdf` | `markitdown`, `pymupdf`, `pypdf`, `pdfplumber`, `pdfminer`, `liteparse`, `opendataloader` |
+| PDF | `.pdf` | `markitdown`, `pymupdf4llm`, `docling`, `pspdfkit`/`pdf-to-markdown` CLI, `pymupdf`, `pypdf`, `pdfplumber`, `pdfminer`, `liteparse`, `opendataloader`, `ocr-tesseract` |
 | Word | `.docx` | `markitdown`, `python-docx` |
 | PPT | `.pptx` | `markitdown`, `python-pptx` |
 | Excel | `.xlsx` | `markitdown`, `openpyxl` |
@@ -61,11 +66,18 @@ Legacy binary Office formats such as `.doc`, `.ppt`, and `.xls` may be detected,
 ```powershell
 python scripts\parse_document_compare.py doctor --format pdf --ocr --opendataloader --json
 python scripts\parse_document_compare.py compare "D:\path\file.pdf" --max-pages 3 --output-format md
+python scripts\parse_document_compare.py vote "D:\path\file.pdf" --probe-before-vote --max-pages 3 --format all
+python scripts\parse_document_compare.py vote "D:\path\file.pdf" --probe-before-vote --max-pages 0 --format all --parsers markitdown,pymupdf4llm,docling,pymupdf,pdfplumber,ocr-tesseract --timeout 120 --parser-health-cache
+python scripts\parse_document_compare.py customer-pack "D:\path\file.pdf" --max-pages 0 --table-pages all --layout-max-pages 30
+python scripts\parse_document_compare.py batch-customer-pack "D:\docs" --recursive --max-pages 0 --table-pages all --layout-max-pages 30 --timeout 120 --parser-health-cache
+python scripts\parse_document_compare.py vote "D:\path\invoice.pdf" --probe-before-vote --max-pages 0 --format all --profile invoice --customer
+python scripts\parse_document_compare.py probe "D:\path\file.pdf" --max-pages 1 --timeout 120 --parser-health-cache --keep-outputs
 python scripts\parse_document_compare.py compare "D:\path\file.pdf" --start-page 100 --max-pages 10 --output-format all
 python scripts\parse_document_compare.py convert "D:\path\file.docx" --parser markitdown --format json -o "D:\path\file.json"
 python scripts\parse_document_compare.py batch "D:\docs" --ext .pdf,.docx --parser markitdown --format txt
 python scripts\parse_document_compare.py scan-dir "D:\docs" --ext .pdf --max-pages 3 --min-quality 0.6 --fail-on-bad
 python scripts\parse_document_compare.py tables "D:\path\file.pdf" --pages 1-5 --format all
+python scripts\parse_document_compare.py table-vote "D:\path\file.pdf" --pages all --format all
 python scripts\parse_document_compare.py metadata "D:\path\file.pdf" --format json
 python scripts\parse_document_compare.py chunk "D:\path\file.pdf" --parser pymupdf --format jsonl --chunk-size 2000 --overlap 200
 python scripts\parse_document_compare.py chunk "D:\path\file.pdf" --parser pymupdf --chunk-by page --format jsonl
@@ -96,6 +108,11 @@ python scripts\parse_document_compare.py compare "D:\path\file.pdf" --max-pages 
 
 Other command outputs:
 
+- `vote`: `vote_report.md`, `vote_report.json`, and `best.md`/`best.txt`/`best.json` depending on `--format`. With `--customer`, also writes `customer_best.md`/`customer_best.txt`/`customer_best.json`; with `--profile invoice`, those customer files contain structured invoice fields, validation results, and field-level confidence. With `--probe-before-vote`, it first writes `preflight_probe/probe_report.md` and `preflight_probe/probe_report.json`, then only sends `ready` parsers into the final vote.
+- `customer-pack`: `manifest.json`, `README.md`, `metadata.json`, `vote_report.md/json`, `preflight_probe/probe_report.md/json`, `best.md/txt/json`, optional `customer_best.md/txt/json`, `tables/table_vote_report.md/json`, `tables/best_tables.md/csv/json`, `layout.json`, and `page_map.json`.
+- `batch-customer-pack`: per-file customer-pack directories plus top-level `index.json` and `index.md`.
+- `probe`: `probe_report.md`, `probe_report.json`, and per-parser sample text. It distinguishes `ready`, `dependency_missing`, `runtime_failed`, `quality_failed`, and `timeout`.
+- `table-vote`: `table_vote_report.md/json` and `best_tables.md/csv/json`.
 - `auto`: `auto_report.md`, `auto_report.json`, `metadata.json`, `best.md`, `best.txt`, `best.json`, chunk outputs, and `fields.json`/`fields.md` for invoices.
 - `scan-dir`: `scan_report.md`, `scan_report.json`, and `scan_report.csv`.
 - `chunk`: JSONL by default, with source metadata, parser name, offsets, and text.

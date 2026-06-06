@@ -13,7 +13,7 @@
     diff-docs — 文档版本差异对比
 
 支持格式：
-    PDF  (.pdf)  — markitdown / pymupdf / pypdf / pdfplumber / pdfminer / liteparse
+    PDF  (.pdf)  — markitdown / pymupdf4llm / docling / pspdfkit / pymupdf / pypdf / pdfplumber / pdfminer / liteparse
     Word (.docx) — markitdown / python-docx
     PPT  (.pptx) — markitdown / python-pptx
     Excel(.xlsx) — markitdown / openpyxl
@@ -28,7 +28,7 @@
 """
 from __future__ import annotations
 
-__version__ = "4.1.0"
+__version__ = "4.8.0"
 
 import argparse
 import csv
@@ -39,9 +39,11 @@ import json
 import logging
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
@@ -60,7 +62,10 @@ _RE_TOKEN = re.compile(r"[A-Za-z0-9_]+|[一-鿿]")
 
 QUALITY_BAD_LABELS = {"empty", "bad"}
 PAGE_CHUNK_PARSERS = {"pymupdf", "pypdf", "pdfplumber", "pdfminer"}
+PDF_SUBSET_TARGET_PARSERS = {"markitdown", "pymupdf4llm", "docling", "pspdfkit"}
 RAG_SNIPPET_CHARS = 500
+PARSER_HEALTH_CACHE_TTL_SECONDS = 24 * 60 * 60
+PARSER_HEALTH_CACHE_STATUSES = {"failed", "skipped", "timeout"}
 
 # ---------------------------------------------------------------------------
 # 数据结构
@@ -91,7 +96,24 @@ class ParseResult:
 # ---------------------------------------------------------------------------
 
 def module_exists(module_name: str) -> bool:
-    return importlib.util.find_spec(module_name) is not None
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except ModuleNotFoundError:
+        return False
+
+
+def command_exists(*command_names: str) -> bool:
+    """Return whether at least one command name is available on PATH."""
+    return any(shutil.which(command_name) is not None for command_name in command_names)
+
+
+def find_command(*command_names: str) -> str | None:
+    """Return the first available command name/path from PATH."""
+    for command_name in command_names:
+        found = shutil.which(command_name)
+        if found:
+            return found
+    return None
 
 
 def normalize_text(text: str) -> str:
@@ -353,6 +375,173 @@ def write_text(out_dir: Path, parser_name: str, text: str) -> tuple[Path, str]:
     return write_extracted_outputs(out_dir, parser_name, text, "md")
 
 
+def default_parser_health_cache_path(out_dir: Path) -> Path:
+    """Default parser health cache path colocated with the current run outputs."""
+    return out_dir / ".parser_health_cache.json"
+
+
+def load_parser_health_cache(path: Path | None) -> dict[str, object]:
+    """Load parser health cache if present."""
+    if path is None or not path.exists():
+        return {"version": __version__, "entries": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"version": __version__, "entries": {}}
+    if not isinstance(data, dict):
+        return {"version": __version__, "entries": {}}
+    if not isinstance(data.get("entries"), dict):
+        data["entries"] = {}
+    return data
+
+
+def write_parser_health_cache(path: Path | None, cache: dict[str, object]) -> None:
+    """Persist parser health cache without failing the parse workflow."""
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        cache["version"] = __version__
+        cache["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        logger.debug("failed to write parser health cache %s: %r", path, exc)
+
+
+def parser_health_cache_key(file_path: Path, fmt: str, parser_name: str, start_page: int, max_pages: int | None) -> str:
+    """Build a conservative cache key for parser runtime health."""
+    return "|".join([fmt, parser_name, str(file_path.resolve()), str(start_page), str(max_pages)])
+
+
+def should_skip_parser_from_health_cache(
+    cache: dict[str, object],
+    key: str,
+    ttl_seconds: int = PARSER_HEALTH_CACHE_TTL_SECONDS,
+) -> tuple[bool, str | None]:
+    """Return whether a recent unhealthy parser entry should be skipped."""
+    entries = cache.get("entries") if isinstance(cache.get("entries"), dict) else {}
+    entry = entries.get(key) if isinstance(entries, dict) else None
+    if not isinstance(entry, dict):
+        return False, None
+    status = str(entry.get("status") or "")
+    timestamp = float(entry.get("timestamp") or 0)
+    if status not in PARSER_HEALTH_CACHE_STATUSES:
+        return False, None
+    if ttl_seconds > 0 and time.time() - timestamp > ttl_seconds:
+        return False, None
+    reason = str(entry.get("error") or entry.get("reason") or status)
+    return True, reason
+
+
+def update_parser_health_cache(
+    cache: dict[str, object],
+    key: str,
+    parser_name: str,
+    result: ParseResult,
+    timeout_seconds: float | None = None,
+) -> None:
+    """Record parser runtime health for later runs."""
+    entries = cache.setdefault("entries", {})
+    if not isinstance(entries, dict):
+        entries = {}
+        cache["entries"] = entries
+    entries[key] = {
+        "parser": parser_name,
+        "status": result.status,
+        "quality_label": result.quality_label,
+        "quality_score": result.quality_score,
+        "seconds": result.seconds,
+        "error": result.error,
+        "timeout_seconds": timeout_seconds,
+        "timestamp": time.time(),
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def extract_one_subprocess(
+    file_path: Path,
+    fmt: str,
+    parser_name: str,
+    out_dir: Path,
+    output_format: str,
+    start_page: int,
+    max_pages: int | None,
+    timeout_seconds: float,
+) -> tuple[ParseResult, str]:
+    """Run one parser in a child process so slow parsers can be killed on timeout."""
+    temp_dir = Path(tempfile.mkdtemp(prefix="parse_one_"))
+    payload_path = temp_dir / "payload.json"
+    result_path = temp_dir / "result.json"
+    payload = {
+        "file": str(file_path),
+        "fmt": fmt,
+        "parser": parser_name,
+        "out_dir": str(out_dir),
+        "output_format": output_format,
+        "start_page": start_page,
+        "max_pages": max_pages,
+        "result_path": str(result_path),
+    }
+    payload_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    start = time.perf_counter()
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "__extract-one", str(payload_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        seconds = round(time.perf_counter() - start, 3)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return ParseResult(
+            parser=parser_name,
+            status="timeout",
+            seconds=seconds,
+            error=f"timeout_after_{timeout_seconds}s",
+        ), ""
+
+    try:
+        if completed.returncode != 0:
+            seconds = round(time.perf_counter() - start, 3)
+            err = (completed.stderr or completed.stdout or "").strip()
+            return ParseResult(parser=parser_name, status="failed", seconds=seconds, error=err[:2000] or f"exit_{completed.returncode}"), ""
+        data = json.loads(result_path.read_text(encoding="utf-8"))
+        result_data = data.get("result") if isinstance(data.get("result"), dict) else {}
+        result = ParseResult(**result_data)
+        return result, str(data.get("normalized") or "")
+    except Exception as exc:
+        seconds = round(time.perf_counter() - start, 3)
+        return ParseResult(parser=parser_name, status="failed", seconds=seconds, error=f"invalid_child_result: {exc!r}"), ""
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def cmd_extract_one_internal(payload_path: Path) -> int:
+    """Internal helper for timed parser subprocesses."""
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    file_path = Path(str(payload["file"]))
+    fmt = str(payload["fmt"])
+    parser_name = str(payload["parser"])
+    out_dir = Path(str(payload["out_dir"]))
+    output_format = str(payload["output_format"])
+    start_page = int(payload["start_page"])
+    max_pages = payload.get("max_pages")
+    max_pages = int(max_pages) if max_pages is not None else None
+    result_path = Path(str(payload["result_path"]))
+    extract_func = get_extractor(fmt, parser_name)
+    if extract_func is None:
+        raise RuntimeError(f"未注册的解析器：{parser_name}")
+    start = time.perf_counter()
+    raw_text = extract_func(file_path, start_page, max_pages)
+    out_file, normalized = write_extracted_outputs(out_dir, parser_name, raw_text, output_format)
+    result = text_stats(parser_name, "ok", time.perf_counter() - start, normalized, out_file)
+    write_json_file(result_path, {"result": asdict(result), "normalized": normalized})
+    return 0
+
+
 def parse_page_spec(spec: str, total_pages: int) -> list[int]:
     """解析页码规格，如 '1-5' 或 '1,3,5' 或 '1-3,7,10-12'。返回 0-based 索引列表。"""
     pages: set[int] = set()
@@ -425,7 +614,19 @@ EXTENSION_FORMAT_MAP: dict[str, str] = {
 }
 
 FORMAT_PARSERS: dict[str, list[str]] = {
-    "pdf":     ["markitdown", "pymupdf", "pypdf", "pdfplumber", "pdfminer", "liteparse", "opendataloader"],
+    "pdf":     [
+        "markitdown",
+        "pymupdf4llm",
+        "docling",
+        "pspdfkit",
+        "pymupdf",
+        "pypdf",
+        "pdfplumber",
+        "pdfminer",
+        "liteparse",
+        "opendataloader",
+        "ocr-tesseract",
+    ],
     "word":    ["markitdown", "python-docx"],
     "ppt":     ["markitdown", "python-pptx"],
     "excel":   ["markitdown", "openpyxl"],
@@ -440,12 +641,15 @@ FORMAT_PARSERS: dict[str, list[str]] = {
 
 PARSER_MODULES: dict[str, list[str]] = {
     "markitdown": ["markitdown"],
+    "pymupdf4llm": ["pymupdf4llm"],
+    "docling": ["docling.document_converter"],
     "pymupdf": ["fitz"],
     "pypdf": ["pypdf", "PyPDF2"],
     "pdfplumber": ["pdfplumber"],
     "pdfminer": ["pdfminer.high_level"],
     "liteparse": ["liteparse"],
     "opendataloader": ["opendataloader_pdf"],
+    "ocr-tesseract": ["fitz", "pytesseract", "PIL"],
     "python-docx": ["docx"],
     "python-pptx": ["pptx"],
     "openpyxl": ["openpyxl"],
@@ -453,14 +657,23 @@ PARSER_MODULES: dict[str, list[str]] = {
 }
 
 
+PARSER_COMMANDS: dict[str, list[str]] = {
+    "pspdfkit": ["pdf-to-markdown", "pspdfkit-pdf-to-markdown"],
+}
+
+
 PARSER_PACKAGES: dict[str, str] = {
     "markitdown": "markitdown",
+    "pymupdf4llm": "pymupdf4llm",
+    "docling": "docling",
+    "pspdfkit": "@pspdfkit/pdf-to-markdown (pdf-to-markdown CLI)",
     "pymupdf": "pymupdf",
     "pypdf": "pypdf",
     "pdfplumber": "pdfplumber",
     "pdfminer": "pdfminer.six",
     "liteparse": "liteparse",
     "opendataloader": "opendataloader-pdf",
+    "ocr-tesseract": "pymupdf pytesseract pillow + system Tesseract OCR",
     "python-docx": "python-docx",
     "python-pptx": "python-pptx",
     "openpyxl": "openpyxl",
@@ -516,7 +729,12 @@ def get_parsers_for_format(fmt: str) -> list[str]:
 
 
 def parser_available(parser_name: str) -> bool:
-    """Return whether at least one module for a parser is importable."""
+    """Return whether a parser's Python module or external command is available."""
+    commands = PARSER_COMMANDS.get(parser_name)
+    if commands:
+        return command_exists(*commands)
+    if parser_name == "ocr-tesseract":
+        return module_exists("fitz") and module_exists("pytesseract") and module_exists("PIL") and shutil.which("tesseract") is not None
     modules = PARSER_MODULES.get(parser_name, [parser_name])
     return any(module_exists(module_name) for module_name in modules)
 
@@ -527,16 +745,20 @@ def parser_dependency_rows(fmt_filter: str | None = None) -> list[dict[str, obje
     rows: list[dict[str, object]] = []
     for fmt in formats:
         for parser_name in FORMAT_PARSERS.get(fmt, []):
-            modules = PARSER_MODULES.get(parser_name, [parser_name])
+            commands = PARSER_COMMANDS.get(parser_name, [])
+            modules = [] if commands else PARSER_MODULES.get(parser_name, [parser_name])
             package = PARSER_PACKAGES.get(parser_name, parser_name)
             available = parser_available(parser_name)
+            kind = "command" if commands else "ocr" if parser_name == "ocr-tesseract" else "python"
             rows.append(
                 {
                     "format": fmt,
                     "parser": parser_name,
                     "available": available,
                     "status": "ok" if available else "missing",
+                    "kind": kind,
                     "modules": modules,
+                    "commands": commands + (["tesseract"] if parser_name == "ocr-tesseract" else []),
                     "package": package,
                 }
             )
@@ -549,7 +771,7 @@ def extract_text_with_parser(
     start_page: int = 1,
     max_pages: int | None = None,
 ) -> str:
-    """Extract text with one parser and handle MarkItDown PDF page slicing."""
+    """Extract text with one parser and handle whole-PDF parser page slicing."""
     fmt = detect_format(file_path)
     if fmt is None:
         raise ValueError(f"不支持的文件格式：{file_path.suffix}")
@@ -563,9 +785,9 @@ def extract_text_with_parser(
     temp_dir_obj: tempfile.TemporaryDirectory[str] | None = None
     try:
         target_path = file_path
-        if fmt == "pdf" and parser_name == "markitdown":
+        if fmt == "pdf" and parser_name in PDF_SUBSET_TARGET_PARSERS:
             temp_dir_obj = tempfile.TemporaryDirectory(prefix="parse_extract_")
-            target_path, skip_reason = prepare_markitdown_pdf_target(
+            target_path, skip_reason = prepare_pdf_subset_target(
                 file_path, start_page, max_pages, Path(temp_dir_obj.name)
             )
             if skip_reason:
@@ -821,13 +1043,83 @@ def _extract_pdf_markitdown(pdf_path: Path, start_page: int, max_pages: int | No
     return getattr(result, "text_content", "") or ""
 
 
-def prepare_markitdown_pdf_target(
+def _extract_pdf_pymupdf4llm(pdf_path: Path, start_page: int, max_pages: int | None) -> str:
+    """使用 pymupdf4llm 生成面向 LLM/RAG 的 Markdown。"""
+    if not module_exists("pymupdf4llm"):
+        raise ImportError("未安装 pymupdf4llm，运行: pip install pymupdf4llm")
+    import pymupdf4llm  # type: ignore
+
+    return pymupdf4llm.to_markdown(str(pdf_path)) or ""
+
+
+def _extract_pdf_docling(pdf_path: Path, start_page: int, max_pages: int | None) -> str:
+    """使用 Docling 解析 PDF 并导出 Markdown。"""
+    if not module_exists("docling.document_converter"):
+        raise ImportError("未安装 docling，运行: pip install docling")
+    from docling.document_converter import DocumentConverter  # type: ignore
+
+    result = DocumentConverter().convert(str(pdf_path))
+    document = getattr(result, "document", None)
+    if document is None or not hasattr(document, "export_to_markdown"):
+        raise RuntimeError("docling 未返回可导出 Markdown 的 document")
+    return document.export_to_markdown() or ""
+
+
+def _extract_pdf_pspdfkit(pdf_path: Path, start_page: int, max_pages: int | None) -> str:
+    """使用 PSPDFKit/Nutrient pdf-to-markdown CLI 解析 PDF。"""
+    command = find_command("pdf-to-markdown", "pspdfkit-pdf-to-markdown")
+    if command is None:
+        raise ImportError(
+            "未找到 pdf-to-markdown CLI。安装 @pspdfkit/pdf-to-markdown 后确保 pdf-to-markdown 在 PATH 中；"
+            "该工具当前主要支持 macOS/Linux，Windows 环境可能不可用。"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="pspdfkit_pdfmd_") as tmpdir:
+        out_dir = Path(tmpdir)
+        out_file = out_dir / f"{pdf_path.stem}.md"
+        candidates = [
+            [command, str(pdf_path)],
+            [command, str(pdf_path), str(out_file)],
+        ]
+        errors: list[str] = []
+        for cmd in candidates:
+            try:
+                completed = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+            except OSError as exc:
+                errors.append(repr(exc))
+                continue
+
+            stdout = completed.stdout.strip()
+            if completed.returncode == 0 and stdout:
+                return stdout
+
+            if completed.returncode == 0 and out_file.exists():
+                return out_file.read_text(encoding="utf-8", errors="replace")
+
+            md_files = sorted(out_dir.glob("*.md"))
+            if completed.returncode == 0 and md_files:
+                return "\n\n".join(path.read_text(encoding="utf-8", errors="replace") for path in md_files)
+
+            stderr = completed.stderr.strip()
+            errors.append(stderr or stdout or f"exit code {completed.returncode}")
+
+        raise RuntimeError("pdf-to-markdown CLI 解析失败：" + " | ".join(errors))
+
+
+def prepare_pdf_subset_target(
     pdf_path: Path,
     start_page: int,
     max_pages: int | None,
     tmp_dir: Path,
 ) -> tuple[Path, str | None]:
-    """Return a page-limited PDF for MarkItDown when possible."""
+    """Return a page-limited PDF for whole-document parsers when possible."""
     if max_pages is None:
         return pdf_path, None
 
@@ -835,7 +1127,7 @@ def prepare_markitdown_pdf_target(
     if subset:
         return subset, None
 
-    return pdf_path, "设置了 --max-pages，但当前环境无法生成临时子 PDF；已跳过 markitdown"
+    return pdf_path, "设置了 --max-pages，但当前环境无法生成临时子 PDF；已跳过需要整份 PDF 输入的解析器"
 
 
 def _extract_pdf_pymupdf(pdf_path: Path, start_page: int, max_pages: int | None) -> str:
@@ -1271,31 +1563,113 @@ def _extract_archive_markitdown(file_path: Path, start_page: int, max_pages: int
     return text
 
 
+def _extract_pdf_ocr_tesseract(file_path: Path, start_page: int, max_pages: int | None) -> str:
+    """Render PDF pages and run Tesseract OCR so OCR can join parser voting."""
+    page_count = get_pdf_page_count(file_path)
+    first = max(0, start_page - 1)
+    if first >= page_count:
+        return ""
+    last = page_count if max_pages is None else min(page_count, first + max(0, max_pages))
+    page_indices = list(range(first, last))
+    pages = ocr_pdf_pages(file_path, page_indices, "chi_sim+eng", 200)
+    return ocr_pages_to_text(pages)
+
+
 # ---------------------------------------------------------------------------
 # 表格提取（PDF 专用）
 # ---------------------------------------------------------------------------
 
-def extract_tables_from_pdf(pdf_path: Path, page_indices: list[int]) -> list[dict]:
-    """从 PDF 提取表格，返回 [{page, table_index, headers, rows}, ...]。"""
+def normalize_table_cells(table: list[list[object | None]]) -> tuple[list[str], list[list[str]]]:
+    """Normalize a raw table into headers and rows."""
+    if not table:
+        return [], []
+    headers = [str(h).strip() if h is not None else "" for h in table[0]]
+    rows: list[list[str]] = []
+    for row in table[1:]:
+        rows.append([str(cell).strip() if cell is not None else "" for cell in row])
+    return headers, rows
+
+
+def table_quality_metrics(table: dict[str, object]) -> dict[str, object]:
+    """Score a table by density, shape consistency, and header usefulness."""
+    headers = table.get("headers") if isinstance(table.get("headers"), list) else []
+    rows = table.get("rows") if isinstance(table.get("rows"), list) else []
+    column_count = max(len(headers), max((len(row) for row in rows if isinstance(row, list)), default=0))
+    row_count = len(rows)
+    cells = list(headers)
+    for row in rows:
+        if isinstance(row, list):
+            cells.extend(row)
+    total_cells = len(cells)
+    non_empty_cells = sum(1 for cell in cells if str(cell or "").strip())
+    density = non_empty_cells / max(1, total_cells)
+    expected = column_count or 1
+    consistent_rows = sum(1 for row in rows if isinstance(row, list) and len(row) == expected)
+    consistency = consistent_rows / max(1, row_count)
+    header_non_empty = sum(1 for cell in headers if str(cell or "").strip())
+    header_score = header_non_empty / max(1, len(headers))
+    size_score = min(1.0, (row_count * max(1, column_count)) / 24)
+    score = (
+        density * 0.36
+        + consistency * 0.24
+        + header_score * 0.20
+        + size_score * 0.20
+    )
+    if row_count == 0 or column_count < 2:
+        score *= 0.45
+    return {
+        "score": round(max(0.0, min(1.0, score)), 4),
+        "row_count": row_count,
+        "column_count": column_count,
+        "non_empty_cells": non_empty_cells,
+        "density": round(density, 4),
+        "shape_consistency": round(consistency, 4),
+        "header_score": round(header_score, 4),
+        "size_score": round(size_score, 4),
+    }
+
+
+def annotate_tables(tables: list[dict[str, object]], method: str) -> list[dict[str, object]]:
+    """Attach method and quality metrics to extracted tables."""
+    annotated: list[dict[str, object]] = []
+    for index, table in enumerate(tables, 1):
+        item = dict(table)
+        item.setdefault("table_index", index)
+        item["method"] = method
+        item["quality"] = table_quality_metrics(item)
+        annotated.append(item)
+    return annotated
+
+
+def extract_tables_pdfplumber(pdf_path: Path, page_indices: list[int], strategy: str = "default") -> list[dict[str, object]]:
+    """Extract PDF tables with pdfplumber using default or text-oriented settings."""
     if not module_exists("pdfplumber"):
         raise ImportError("表格提取需要 pdfplumber，运行: pip install pdfplumber")
     import pdfplumber  # type: ignore
 
-    tables: list[dict] = []
+    settings = None
+    if strategy == "text":
+        settings = {
+            "vertical_strategy": "text",
+            "horizontal_strategy": "text",
+            "intersection_tolerance": 8,
+            "snap_tolerance": 4,
+            "join_tolerance": 4,
+            "min_words_vertical": 2,
+            "min_words_horizontal": 1,
+        }
+
+    tables: list[dict[str, object]] = []
     with pdfplumber.open(str(pdf_path)) as pdf:
         for page_idx in page_indices:
             if page_idx >= len(pdf.pages):
                 continue
             page = pdf.pages[page_idx]
-            page_tables = page.extract_tables()
+            page_tables = page.extract_tables(table_settings=settings) if settings else page.extract_tables()
             for tbl_idx, tbl in enumerate(page_tables):
                 if not tbl:
                     continue
-                # 第一行作为表头
-                headers = [str(h).strip() if h else "" for h in tbl[0]]
-                rows = []
-                for row in tbl[1:]:
-                    rows.append([str(cell).strip() if cell else "" for cell in row])
+                headers, rows = normalize_table_cells(tbl)
                 tables.append({
                     "page": page_idx + 1,
                     "table_index": tbl_idx + 1,
@@ -1303,6 +1677,232 @@ def extract_tables_from_pdf(pdf_path: Path, page_indices: list[int]) -> list[dic
                     "rows": rows,
                 })
     return tables
+
+
+def split_text_columns(line: str) -> list[str]:
+    """Split a text line into likely table columns."""
+    if "\t" in line:
+        parts = [part.strip() for part in line.split("\t")]
+    elif "|" in line:
+        parts = [part.strip() for part in line.strip("|").split("|")]
+    else:
+        parts = [part.strip() for part in re.split(r"\s{2,}", line.strip())]
+    return [part for part in parts if part]
+
+
+def extract_tables_pymupdf_text(pdf_path: Path, page_indices: list[int]) -> list[dict[str, object]]:
+    """Heuristic table extraction from PyMuPDF text blocks for borderless tables."""
+    if not module_exists("fitz"):
+        raise ImportError("pymupdf-text 表格候选需要 PyMuPDF/fitz，运行: pip install pymupdf")
+    import fitz  # type: ignore
+
+    tables: list[dict[str, object]] = []
+    doc = fitz.open(pdf_path)
+    try:
+        for page_idx in page_indices:
+            if page_idx < 0 or page_idx >= doc.page_count:
+                continue
+            text = doc.load_page(page_idx).get_text("text")
+            current: list[list[str]] = []
+            table_index = 1
+            for raw_line in text.splitlines() + [""]:
+                cells = split_text_columns(raw_line)
+                if len(cells) >= 2:
+                    current.append(cells)
+                    continue
+                if len(current) >= 2:
+                    width = max(len(row) for row in current)
+                    rectangular = [row + [""] * (width - len(row)) for row in current]
+                    headers = rectangular[0]
+                    rows = rectangular[1:]
+                    tables.append({
+                        "page": page_idx + 1,
+                        "table_index": table_index,
+                        "headers": headers,
+                        "rows": rows,
+                    })
+                    table_index += 1
+                current = []
+    finally:
+        doc.close()
+    return tables
+
+
+def extract_tables_from_pdf(pdf_path: Path, page_indices: list[int]) -> list[dict[str, object]]:
+    """Extract PDF tables with the default high-precision parser."""
+    return annotate_tables(extract_tables_pdfplumber(pdf_path, page_indices, "default"), "pdfplumber")
+
+
+def extract_tables_by_method(pdf_path: Path, page_indices: list[int], method: str) -> list[dict[str, object]]:
+    """Extract tables with a named table parser/method."""
+    if method == "pdfplumber":
+        return annotate_tables(extract_tables_pdfplumber(pdf_path, page_indices, "default"), method)
+    if method == "pdfplumber-text":
+        return annotate_tables(extract_tables_pdfplumber(pdf_path, page_indices, "text"), method)
+    if method == "pymupdf-text":
+        return annotate_tables(extract_tables_pymupdf_text(pdf_path, page_indices), method)
+    raise ValueError(f"unknown table parser: {method}")
+
+
+def table_signature(table: dict[str, object]) -> tuple[int, int, int]:
+    """Build a rough signature for table consensus."""
+    quality = table.get("quality") if isinstance(table.get("quality"), dict) else table_quality_metrics(table)
+    return (
+        int(table.get("page") or 0),
+        int(quality.get("row_count") or 0),
+        int(quality.get("column_count") or 0),
+    )
+
+
+def build_table_vote_payload(
+    pdf_path: Path,
+    page_indices: list[int],
+    methods: list[str],
+) -> dict[str, object]:
+    """Run table extraction methods and choose the best table set."""
+    method_rows: list[dict[str, object]] = []
+    signature_counts: Counter[tuple[int, int, int]] = Counter()
+    for method in methods:
+        try:
+            start = time.perf_counter()
+            tables = extract_tables_by_method(pdf_path, page_indices, method)
+            seconds = round(time.perf_counter() - start, 3)
+            for table in tables:
+                signature_counts[table_signature(table)] += 1
+            quality_scores = [
+                float((table.get("quality") if isinstance(table.get("quality"), dict) else {}).get("score") or 0.0)
+                for table in tables
+            ]
+            avg_quality = round(sum(quality_scores) / max(1, len(quality_scores)), 4)
+            coverage = min(1.0, len(tables) / max(1, len(page_indices)))
+            method_rows.append({
+                "method": method,
+                "status": "ok",
+                "seconds": seconds,
+                "table_count": len(tables),
+                "avg_quality": avg_quality,
+                "coverage_score": round(coverage, 4),
+                "tables": tables,
+                "error": None,
+            })
+        except Exception as exc:
+            method_rows.append({
+                "method": method,
+                "status": "failed",
+                "seconds": 0,
+                "table_count": 0,
+                "avg_quality": 0.0,
+                "coverage_score": 0.0,
+                "tables": [],
+                "error": repr(exc),
+            })
+
+    for row in method_rows:
+        consensus_hits = 0
+        tables = row.get("tables") if isinstance(row.get("tables"), list) else []
+        for table in tables:
+            if isinstance(table, dict) and signature_counts[table_signature(table)] > 1:
+                consensus_hits += 1
+        consensus_score = consensus_hits / max(1, len(tables))
+        row["consensus_score"] = round(consensus_score, 4)
+        row["vote_score"] = round(
+            min(
+                1.0,
+                float(row.get("avg_quality") or 0.0) * 0.48
+                + consensus_score * 0.26
+                + float(row.get("coverage_score") or 0.0) * 0.18
+                + min(1.0, int(row.get("table_count") or 0) / 5) * 0.08,
+            ),
+            4,
+        ) if row.get("status") == "ok" else 0.0
+
+    winners = [row for row in method_rows if row.get("status") == "ok" and int(row.get("table_count") or 0) > 0]
+    winners.sort(key=lambda row: (float(row.get("vote_score") or 0.0), float(row.get("avg_quality") or 0.0), int(row.get("table_count") or 0)), reverse=True)
+    winner = winners[0] if winners else None
+    diagnostics = []
+    if winner:
+        diagnostics.append(f"Selected table parser {winner.get('method')} by quality, coverage, and cross-method consensus.")
+    else:
+        diagnostics.append("No table parser produced usable tables.")
+    if any(row.get("status") == "failed" for row in method_rows):
+        diagnostics.append("One or more table parsers failed; see method rows for dependency/runtime errors.")
+    return {
+        "version": __version__,
+        "type": "table-vote",
+        "source_file": str(pdf_path),
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "pages": [index + 1 for index in page_indices],
+        "methods": methods,
+        "winner": {
+            key: winner.get(key)
+            for key in ["method", "vote_score", "avg_quality", "consensus_score", "coverage_score", "table_count", "seconds"]
+        } if winner else None,
+        "diagnostics": diagnostics,
+        "rows": method_rows,
+        "best_tables": winner.get("tables") if winner else [],
+    }
+
+
+def table_vote_to_markdown(payload: dict[str, object]) -> str:
+    """Render table vote payload as Markdown."""
+    winner = payload.get("winner") if isinstance(payload.get("winner"), dict) else None
+    lines = [
+        "# Table Vote Report",
+        "",
+        f"- Source: `{payload.get('source_file')}`",
+        f"- Pages: `{payload.get('pages')}`",
+        f"- Winner: `{winner.get('method') if winner else None}`",
+        f"- Vote score: `{winner.get('vote_score') if winner else 0}`",
+        "",
+        "## Methods",
+        "",
+        "| Method | Status | Vote | Avg quality | Consensus | Coverage | Tables | Time(s) | Error |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---|",
+    ]
+    rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        error = str(row.get("error") or "").replace("|", "\\|")
+        lines.append(
+            f"| {row.get('method')} | {row.get('status')} | {row.get('vote_score')} | "
+            f"{row.get('avg_quality')} | {row.get('consensus_score')} | {row.get('coverage_score')} | "
+            f"{row.get('table_count')} | {row.get('seconds')} | {error[:180]} |"
+        )
+    diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), list) else []
+    lines.extend(["", "## Diagnostics", ""])
+    for item in diagnostics:
+        lines.append(f"- {item}")
+    best_tables = payload.get("best_tables") if isinstance(payload.get("best_tables"), list) else []
+    if best_tables:
+        lines.extend(["", "## Best Tables", "", tables_to_markdown(best_tables)])
+    return "\n".join(lines) + "\n"
+
+
+def write_table_vote_outputs(payload: dict[str, object], out_dir: Path, output_format: str) -> list[Path]:
+    """Write table vote reports and best table outputs."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    report_json = write_json_file(out_dir / "table_vote_report.json", payload)
+    report_md = out_dir / "table_vote_report.md"
+    report_md.write_text(table_vote_to_markdown(payload), encoding="utf-8")
+    written.extend([report_json, report_md])
+    tables = payload.get("best_tables") if isinstance(payload.get("best_tables"), list) else []
+    if not tables:
+        return written
+    suffixes = ["md", "csv", "json"] if output_format == "all" else [output_format]
+    for suffix in suffixes:
+        path = out_dir / f"best_tables.{suffix}"
+        if suffix == "md":
+            path.write_text(tables_to_markdown(tables), encoding="utf-8")
+        elif suffix == "txt":
+            path.write_text(tables_to_markdown(tables), encoding="utf-8")
+        elif suffix == "csv":
+            path.write_text(tables_to_csv(tables), encoding="utf-8")
+        elif suffix == "json":
+            path.write_text(tables_to_json(tables), encoding="utf-8")
+        written.append(path)
+    return written
 
 
 def tables_to_markdown(tables: list[dict]) -> str:
@@ -1353,12 +1953,16 @@ def tables_to_json(tables: list[dict]) -> str:
 _EXTRACTORS: dict[tuple[str, str], Callable[[Path, int, int | None], str]] = {
     # PDF
     ("pdf", "markitdown"):   _extract_pdf_markitdown,
+    ("pdf", "pymupdf4llm"):  _extract_pdf_pymupdf4llm,
+    ("pdf", "docling"):      _extract_pdf_docling,
+    ("pdf", "pspdfkit"):     _extract_pdf_pspdfkit,
     ("pdf", "pymupdf"):      _extract_pdf_pymupdf,
     ("pdf", "pypdf"):        _extract_pdf_pypdf,
     ("pdf", "pdfplumber"):   _extract_pdf_pdfplumber,
     ("pdf", "pdfminer"):     _extract_pdf_pdfminer,
     ("pdf", "liteparse"):    _extract_pdf_liteparse,
     ("pdf", "opendataloader"): _extract_pdf_opendataloader,
+    ("pdf", "ocr-tesseract"): _extract_pdf_ocr_tesseract,
     # Word
     ("word", "markitdown"):  _extract_word_markitdown,
     ("word", "python-docx"): _extract_word_docx,
@@ -1399,6 +2003,9 @@ _PARSER_ALIASES: dict[str, str] = {
     "llama-parse": "liteparse",
     "odl": "opendataloader",
     "opendataloader-pdf": "opendataloader",
+    "pdf-to-markdown": "pspdfkit",
+    "pspdfkit-pdf-to-markdown": "pspdfkit",
+    "nutrient": "pspdfkit",
 }
 
 
@@ -1510,6 +2117,1442 @@ def choose_recommended_result(results: list[ParseResult]) -> ParseResult | None:
     return max(ok_results, key=lambda r: (r.quality_score, r.non_space_chars, -r.seconds))
 
 
+def structure_score(text: str) -> float:
+    """Estimate whether output preserved useful Markdown/table/list structure."""
+    lines = text.splitlines()
+    if not lines:
+        return 0.0
+    headings = sum(1 for line in lines if line.lstrip().startswith("#"))
+    table_lines = sum(1 for line in lines if line.strip().startswith("|") and line.strip().endswith("|"))
+    list_lines = sum(1 for line in lines if re.match(r"^\s*(?:[-*+]|\d+[.)])\s+", line))
+    page_markers = text.count("<!-- page ")
+    raw = headings * 0.04 + table_lines * 0.025 + list_lines * 0.015 + page_markers * 0.02
+    return round(min(1.0, raw), 4)
+
+
+def repetition_metrics(text: str) -> dict[str, object]:
+    """Estimate repeated content that can inflate coverage without adding value."""
+    meaningful_lines = [
+        re.sub(r"\s+", " ", line).strip()
+        for line in text.splitlines()
+        if len(re.sub(r"\s+", "", line)) >= 8
+    ]
+    if meaningful_lines:
+        line_counts = Counter(meaningful_lines)
+        duplicate_line_count = sum(count - 1 for count in line_counts.values() if count > 1)
+        duplicate_line_ratio = duplicate_line_count / len(meaningful_lines)
+        max_line_repeat = max(line_counts.values())
+    else:
+        duplicate_line_ratio = 0.0
+        max_line_repeat = 0
+
+    tokens = _RE_TOKEN.findall(compact_text(text))
+    ngram_ratio = 0.0
+    max_ngram_repeat = 0
+    if len(tokens) >= 36:
+        ngram_size = 6
+        ngrams = ["".join(tokens[index:index + ngram_size]) for index in range(0, len(tokens) - ngram_size + 1)]
+        ngram_counts = Counter(ngrams)
+        duplicate_ngram_count = sum(count - 1 for count in ngram_counts.values() if count > 1)
+        ngram_ratio = duplicate_ngram_count / max(1, len(ngrams))
+        max_ngram_repeat = max(ngram_counts.values())
+
+    penalty = 0.0
+    if duplicate_line_ratio > 0.08:
+        penalty += min(0.22, duplicate_line_ratio * 0.55)
+    if ngram_ratio > 0.2:
+        penalty += min(0.18, (ngram_ratio - 0.2) * 0.35)
+    if max_line_repeat >= 3:
+        penalty += min(0.08, (max_line_repeat - 2) * 0.02)
+
+    score = max(0.0, 1.0 - min(0.45, penalty) / 0.45)
+    return {
+        "score": round(score, 4),
+        "penalty": round(min(0.45, penalty), 4),
+        "duplicate_line_ratio": round(duplicate_line_ratio, 4),
+        "repeated_ngram_ratio": round(ngram_ratio, 4),
+        "max_line_repeat": max_line_repeat,
+        "max_ngram_repeat": max_ngram_repeat,
+    }
+
+
+def detect_vote_profile(
+    requested_profile: str,
+    fmt: str,
+    normalized_texts: dict[str, str],
+) -> dict[str, object]:
+    """Resolve auto profile selection for vote workflows."""
+    if requested_profile in {"contract", "bank_statement", "quotation", "purchase_order", "report", "annual_report"}:
+        return {
+            "requested": requested_profile,
+            "resolved": requested_profile,
+            "reason": f"explicit_{requested_profile}_profile",
+            "candidates": [],
+        }
+    if requested_profile == "invoice":
+        return {
+            "requested": requested_profile,
+            "resolved": "invoice",
+            "reason": "explicit_invoice_profile",
+            "candidates": [],
+        }
+    if requested_profile == "none":
+        return {
+            "requested": requested_profile,
+            "resolved": "none",
+            "reason": "explicit_no_profile",
+            "candidates": [],
+        }
+
+    candidates: list[dict[str, object]] = []
+    for parser_name, text in normalized_texts.items():
+        if not text:
+            continue
+        classification = classify_document(text[:50000], {"format": fmt})
+        signals = classification.get("signals") if isinstance(classification.get("signals"), dict) else {}
+        candidates.append({
+            "parser": parser_name,
+            "profile": classification.get("profile"),
+            "confidence": classification.get("confidence"),
+            "invoice_hits": signals.get("invoice_hits"),
+            "contract_hits": signals.get("contract_hits"),
+            "bank_statement_hits": signals.get("bank_statement_hits"),
+            "quotation_hits": signals.get("quotation_hits"),
+            "purchase_order_hits": signals.get("purchase_order_hits"),
+            "report_hits": signals.get("report_hits"),
+            "annual_report_hits": signals.get("annual_report_hits"),
+        })
+
+    invoice_candidates = [
+        item
+        for item in candidates
+        if item.get("profile") == "invoice" or int(item.get("invoice_hits") or 0) >= 3
+    ]
+    if invoice_candidates:
+        return {
+            "requested": requested_profile,
+            "resolved": "invoice",
+            "reason": "auto_detected_invoice",
+            "candidates": candidates,
+        }
+    structured_profiles = {"contract", "bank_statement", "quotation", "purchase_order", "report", "annual_report"}
+    profile_votes = Counter(
+        str(item.get("profile"))
+        for item in candidates
+        if item.get("profile") in structured_profiles
+    )
+    if profile_votes:
+        profile_name, _ = profile_votes.most_common(1)[0]
+        return {
+            "requested": requested_profile,
+            "resolved": profile_name,
+            "reason": f"auto_detected_{profile_name}",
+            "candidates": candidates,
+        }
+    return {
+        "requested": requested_profile,
+        "resolved": "none",
+        "reason": "auto_no_structured_profile",
+        "candidates": candidates,
+    }
+
+
+def invoice_vote_metrics(fields: dict[str, object]) -> dict[str, object]:
+    """Score structured invoice extraction for parser voting."""
+    max_field_score = 23
+    field_score = score_invoice_fields(fields)
+    completeness = min(1.0, field_score / max_field_score)
+    validation = fields.get("validation") if isinstance(fields.get("validation"), dict) else {}
+    status = validation.get("status") if isinstance(validation, dict) else "unknown"
+    missing = validation.get("missing_fields") if isinstance(validation, dict) else []
+    missing_count = len(missing) if isinstance(missing, list) else 0
+    checks = validation.get("checks") if isinstance(validation, dict) else []
+    failed_checks = [
+        check for check in checks
+        if isinstance(check, dict) and not bool(check.get("passed"))
+    ] if isinstance(checks, list) else []
+    item_metrics = invoice_item_repetition_metrics(fields.get("items"))
+    item_count = len(fields.get("items")) if isinstance(fields.get("items"), list) else 0
+
+    validation_adjustment = 0.12 if status == "ok" else -0.12 if status == "failed_checks" else -0.08
+    no_item_penalty = 0.08 if item_count == 0 else 0.0
+    failed_check_penalty = min(0.2, len(failed_checks) * 0.04)
+    missing_penalty = min(0.16, missing_count * 0.025)
+    duplicate_item_penalty = float(item_metrics.get("penalty") or 0.0)
+    score = max(
+        0.0,
+        min(
+            1.0,
+            completeness
+            + validation_adjustment
+            - no_item_penalty
+            - failed_check_penalty
+            - missing_penalty
+            - duplicate_item_penalty,
+        ),
+    )
+    return {
+        "score": round(score, 4),
+        "field_score": field_score,
+        "completeness_score": round(completeness, 4),
+        "validation_status": status,
+        "missing_fields": missing if isinstance(missing, list) else [],
+        "failed_check_count": len(failed_checks),
+        "item_count": item_count,
+        "duplicate_item_ratio": item_metrics.get("duplicate_item_ratio", 0.0),
+        "duplicate_item_penalty": round(duplicate_item_penalty, 4),
+        "penalty": round(no_item_penalty + failed_check_penalty + missing_penalty + duplicate_item_penalty, 4),
+    }
+
+
+def collect_parser_outputs(
+    file_path: Path,
+    fmt: str,
+    parser_names: list[str],
+    out_dir: Path,
+    output_format: str,
+    start_page: int,
+    max_pages: int | None,
+    parallel: bool = False,
+    progress: bool = False,
+    timeout_seconds: float | None = None,
+    health_cache_path: Path | None = None,
+    use_health_cache: bool = False,
+) -> tuple[list[ParseResult], dict[str, str], Path]:
+    """Run parser candidates and write their raw outputs."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if use_health_cache and health_cache_path is None:
+        health_cache_path = default_parser_health_cache_path(out_dir)
+    health_cache = load_parser_health_cache(health_cache_path) if use_health_cache else {"version": __version__, "entries": {}}
+    actual_path = file_path
+    temp_dir_obj: tempfile.TemporaryDirectory[str] | None = None
+    subset_skip_reason: str | None = None
+    if fmt == "pdf" and any(name in PDF_SUBSET_TARGET_PARSERS for name in parser_names):
+        temp_dir_obj = tempfile.TemporaryDirectory(prefix="parse_candidates_")
+        actual_path, subset_skip_reason = prepare_pdf_subset_target(
+            file_path, start_page, max_pages, Path(temp_dir_obj.name)
+        )
+
+    def run_parser(name: str) -> tuple[ParseResult, str]:
+        cache_key = parser_health_cache_key(file_path, fmt, name, start_page, max_pages)
+        if use_health_cache:
+            skip, reason = should_skip_parser_from_health_cache(health_cache, cache_key)
+            if skip:
+                return ParseResult(
+                    parser=name,
+                    status="skipped",
+                    seconds=0,
+                    error=f"parser_health_cache: {reason}",
+                ), ""
+
+        if name in PDF_SUBSET_TARGET_PARSERS and subset_skip_reason:
+            return ParseResult(parser=name, status="skipped", seconds=0, error=subset_skip_reason), ""
+
+        extract_func = get_extractor(fmt, name)
+        if extract_func is None:
+            return ParseResult(parser=name, status="skipped", seconds=0, error=f"未注册的解析器：{name}"), ""
+
+        target = actual_path if (name in PDF_SUBSET_TARGET_PARSERS and fmt == "pdf") else file_path
+        start = time.perf_counter()
+        try:
+            if timeout_seconds and timeout_seconds > 0:
+                result, normalized = extract_one_subprocess(
+                    target,
+                    fmt,
+                    name,
+                    out_dir,
+                    output_format,
+                    start_page,
+                    max_pages,
+                    timeout_seconds,
+                )
+            else:
+                raw_text = extract_func(target, start_page, max_pages)
+                out_file, normalized = write_extracted_outputs(out_dir, name, raw_text, output_format)
+                result = text_stats(name, "ok", time.perf_counter() - start, normalized, out_file)
+            if use_health_cache:
+                update_parser_health_cache(health_cache, cache_key, name, result, timeout_seconds)
+            return result, normalized
+        except Exception as exc:
+            result = ParseResult(
+                parser=name,
+                status="failed",
+                seconds=round(time.perf_counter() - start, 3),
+                error=repr(exc),
+            )
+            if use_health_cache:
+                update_parser_health_cache(health_cache, cache_key, name, result, timeout_seconds)
+            return result, ""
+
+    results: list[ParseResult] = []
+    normalized_texts: dict[str, str] = {}
+    try:
+        if parallel:
+            if progress:
+                print("并行解析中...")
+            with ThreadPoolExecutor(max_workers=min(len(parser_names), 4)) as pool:
+                futures = {pool.submit(run_parser, name): name for name in parser_names}
+                for future in as_completed(futures):
+                    result, text = future.result()
+                    results.append(result)
+                    if text:
+                        normalized_texts[result.parser] = text
+                    if progress:
+                        icon = "OK" if result.status == "ok" else "FAIL" if result.status == "failed" else "SKIP"
+                        print(f"  [{icon}] {result.parser}: {result.chars} chars, {result.seconds}s")
+        else:
+            for name in parser_names:
+                if progress:
+                    print(f"解析中: {name}...", end=" ", flush=True)
+                result, text = run_parser(name)
+                results.append(result)
+                if text:
+                    normalized_texts[result.parser] = text
+                if progress:
+                    if result.status == "ok":
+                        print(f"OK {result.chars} chars, {result.seconds}s")
+                    elif result.status == "failed":
+                        print(f"FAIL {result.error}")
+                    else:
+                        print(f"SKIP {result.error}")
+    finally:
+        if use_health_cache:
+            write_parser_health_cache(health_cache_path, health_cache)
+        if temp_dir_obj:
+            temp_dir_obj.cleanup()
+
+    return results, normalized_texts, actual_path
+
+
+def validate_parser_selection(fmt: str, parsers: str | None) -> tuple[list[str], list[str]]:
+    """Return supported parser names and unsupported names from an optional comma list."""
+    available_parsers = get_parsers_for_format(fmt)
+    if parsers:
+        parser_names = [resolve_parser_name(n.strip().lower()) for n in parsers.split(",") if n.strip()]
+    else:
+        parser_names = available_parsers
+    valid_names = set(available_parsers)
+    unknown = [n for n in parser_names if n not in valid_names]
+    parser_names = [n for n in parser_names if n in valid_names]
+    return parser_names, unknown
+
+
+def build_vote_payload(
+    file_path: Path,
+    actual_path: Path,
+    fmt: str,
+    results: list[ParseResult],
+    normalized_texts: dict[str, str],
+    similarity_chars: int,
+    min_quality: float,
+    fail_on_bad: bool,
+    profile: str = "auto",
+    preflight_probe: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Score parser outputs by quality, consensus, coverage, structure, and profile checks."""
+    ok_results = [r for r in results if r.status == "ok" and r.non_space_chars > 0]
+    max_chars = max((r.non_space_chars for r in ok_results), default=0)
+    profile_info = detect_vote_profile(profile, fmt, normalized_texts)
+    resolved_profile = str(profile_info.get("resolved") or "none")
+    invoice_enabled = resolved_profile == "invoice"
+    weights = {
+        "quality_score": 0.34 if invoice_enabled else 0.42,
+        "consensus_score": 0.18 if invoice_enabled else 0.24,
+        "coverage_score": 0.10 if invoice_enabled else 0.16,
+        "structure_score": 0.08 if invoice_enabled else 0.10,
+        "repetition_score": 0.07 if invoice_enabled else 0.08,
+    }
+    if invoice_enabled:
+        weights["invoice_score"] = 0.23
+    votes: list[dict[str, object]] = []
+
+    for result in results:
+        text = normalized_texts.get(result.parser, "")
+        if result.status != "ok" or result.non_space_chars <= 0:
+            votes.append({
+                "parser": result.parser,
+                "status": result.status,
+                "eligible": False,
+                "vote_score": 0.0,
+                "reason": result.error or "no usable output",
+            })
+            continue
+
+        peers = [peer for peer in ok_results if peer.parser != result.parser]
+        if peers:
+            similarities = [
+                similarity_score(text, normalized_texts.get(peer.parser, ""), similarity_chars)
+                for peer in peers
+            ]
+            consensus = round(sum(similarities) / len(similarities), 4)
+        else:
+            consensus = 0.0
+
+        coverage = round(result.non_space_chars / max(1, max_chars), 4)
+        structure = structure_score(text)
+        repetition = repetition_metrics(text)
+        repetition_score = float(repetition.get("score") or 0.0)
+        duplicate_penalty = float(repetition.get("penalty") or 0.0)
+        invoice_fields: dict[str, object] | None = None
+        invoice_metrics: dict[str, object] | None = None
+        invoice_score = 0.0
+        if invoice_enabled:
+            try:
+                invoice_fields = extract_invoice_fields_from_text(text, file_path, result.parser, result, strict=True)
+                invoice_metrics = invoice_vote_metrics(invoice_fields)
+                invoice_score = float(invoice_metrics.get("score") or 0.0)
+            except Exception as exc:
+                invoice_metrics = {
+                    "score": 0.0,
+                    "validation_status": "failed_extraction",
+                    "error": repr(exc),
+                }
+        penalty = 0.0
+        if result.quality_label in QUALITY_BAD_LABELS:
+            penalty += 0.35
+        if min_quality > 0 and result.quality_score < min_quality:
+            penalty += 0.15
+        if result.cid_markers:
+            penalty += min(0.25, result.cid_markers / max(1, result.non_space_chars) * 8)
+        if result.control_chars:
+            penalty += min(0.2, result.control_chars / max(1, result.non_space_chars) * 6)
+        penalty += duplicate_penalty
+
+        raw_score = (
+            result.quality_score * weights["quality_score"]
+            + consensus * weights["consensus_score"]
+            + coverage * weights["coverage_score"]
+            + structure * weights["structure_score"]
+            + repetition_score * weights["repetition_score"]
+        )
+        if invoice_enabled:
+            raw_score += invoice_score * weights["invoice_score"]
+        vote_score = round(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    raw_score - penalty,
+                ),
+            ),
+            4,
+        )
+        vote_item: dict[str, object] = {
+            "parser": result.parser,
+            "status": result.status,
+            "eligible": True,
+            "vote_score": vote_score,
+            "raw_vote_score": round(raw_score, 4),
+            "quality_score": result.quality_score,
+            "quality_label": result.quality_label,
+            "consensus_score": consensus,
+            "coverage_score": coverage,
+            "structure_score": structure,
+            "repetition_score": repetition_score,
+            "repetition_metrics": repetition,
+            "duplicate_penalty": round(duplicate_penalty, 4),
+            "penalty": round(penalty, 4),
+            "chars": result.chars,
+            "non_space_chars": result.non_space_chars,
+            "seconds": result.seconds,
+            "output_file": result.output_file,
+        }
+        if invoice_enabled:
+            vote_item["invoice_score"] = round(invoice_score, 4)
+            vote_item["invoice_metrics"] = invoice_metrics
+            if invoice_fields is not None:
+                vote_item["invoice_fields"] = invoice_fields
+        votes.append(vote_item)
+
+    eligible_votes = [vote for vote in votes if vote.get("eligible")]
+    eligible_votes.sort(
+        key=lambda vote: (
+            float(vote.get("vote_score", 0.0)),
+            float(vote.get("invoice_score", 0.0)),
+            float(vote.get("repetition_score", 0.0)),
+            float(vote.get("quality_score", 0.0)),
+            int(vote.get("non_space_chars", 0)),
+        ),
+        reverse=True,
+    )
+    winner = eligible_votes[0] if eligible_votes else None
+    recommended = next((r for r in results if winner and r.parser == winner["parser"]), None)
+    gate = quality_gate_status(recommended, min_quality, fail_on_bad)
+    diagnostics = build_diagnostics(results)
+    if len(ok_results) < 2:
+        diagnostics.append("Only one parser produced usable output, so the vote is mostly quality-based rather than consensus-based.")
+    if not winner:
+        diagnostics.append("No parser produced a customer-deliverable output.")
+    if invoice_enabled:
+        diagnostics.append("Invoice profile is enabled: structured field completeness, validation status, and duplicate line-item checks are included in the vote.")
+    if any(float(vote.get("duplicate_penalty") or 0.0) > 0 for vote in votes if isinstance(vote, dict)):
+        diagnostics.append("One or more parser outputs were penalized for repeated lines or repeated text spans.")
+    if preflight_probe:
+        probe_summary = preflight_probe.get("summary") if isinstance(preflight_probe.get("summary"), dict) else {}
+        diagnostics.append(
+            "Preflight probe enabled: only ready parsers entered the final vote "
+            f"({probe_summary.get('ready_count', 0)}/{probe_summary.get('parser_count', 0)} ready)."
+        )
+
+    return {
+        "version": __version__,
+        "type": "vote",
+        "source_file": str(file_path),
+        "actual_file": str(actual_path),
+        "format": fmt,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "similarity_chars": similarity_chars,
+        "profile": profile_info,
+        "preflight_probe": preflight_probe,
+        "weights": weights,
+        "winner": winner,
+        "recommendation": asdict(recommended) if recommended else None,
+        "quality_gate": gate,
+        "diagnostics": diagnostics,
+        "votes": votes,
+        "results": [asdict(r) for r in results],
+    }
+
+
+def vote_to_markdown(payload: dict[str, object]) -> str:
+    """Render a human-readable vote report."""
+    winner = payload.get("winner") if isinstance(payload.get("winner"), dict) else None
+    gate = payload.get("quality_gate") if isinstance(payload.get("quality_gate"), dict) else {}
+    profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else {}
+    lines = [
+        "# Parser Vote Report",
+        "",
+        f"- Source: `{payload.get('source_file')}`",
+        f"- Format: `{payload.get('format')}`",
+        f"- Profile: `{profile.get('resolved', 'none')}` (`{profile.get('reason', '')}`)",
+        f"- Winner: `{winner.get('parser') if winner else None}`",
+        f"- Vote score: `{winner.get('vote_score') if winner else 0}`",
+        f"- Quality gate: `{gate.get('passed')}` (`{gate.get('reason')}`)",
+        "",
+        "## Decision",
+        "",
+    ]
+    if winner:
+        lines.extend([
+            f"- Selected parser: `{winner.get('parser')}`",
+            f"- Quality: `{winner.get('quality_score')}` (`{winner.get('quality_label')}`)",
+            f"- Consensus: `{winner.get('consensus_score')}`",
+            f"- Coverage: `{winner.get('coverage_score')}`",
+            f"- Structure: `{winner.get('structure_score')}`",
+            f"- Repetition: `{winner.get('repetition_score')}` (penalty `{winner.get('duplicate_penalty')}`)",
+            f"- Output: `{winner.get('output_file')}`",
+            "",
+        ])
+        if profile.get("resolved") == "invoice":
+            metrics = winner.get("invoice_metrics") if isinstance(winner.get("invoice_metrics"), dict) else {}
+            lines.extend([
+                f"- Invoice score: `{winner.get('invoice_score')}`",
+                f"- Invoice validation: `{metrics.get('validation_status')}`",
+                f"- Invoice items: `{metrics.get('item_count')}`",
+                "",
+            ])
+    else:
+        lines.extend(["No parser produced a usable output.", ""])
+
+    preflight_probe = payload.get("preflight_probe") if isinstance(payload.get("preflight_probe"), dict) else None
+    if preflight_probe:
+        summary = preflight_probe.get("summary") if isinstance(preflight_probe.get("summary"), dict) else {}
+        ready = summary.get("ready_parsers") if isinstance(summary.get("ready_parsers"), list) else []
+        lines.extend([
+            "## Preflight Probe",
+            "",
+            f"- Ready parsers: `{summary.get('ready_count', 0)}` / `{summary.get('parser_count', 0)}`",
+            f"- Dependency missing: `{summary.get('dependency_missing_count', 0)}`",
+            f"- Runtime failed: `{summary.get('runtime_failed_count', 0)}`",
+            f"- Quality failed: `{summary.get('quality_failed_count', 0)}`",
+            f"- Final vote parsers: `{', '.join(str(name) for name in ready)}`",
+            "",
+        ])
+
+    lines.extend([
+        "## Votes",
+        "",
+        "| Parser | Eligible | Vote | Quality | Consensus | Coverage | Structure | Repetition | Invoice | Penalty | Chars | Time(s) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ])
+    votes = payload.get("votes") if isinstance(payload.get("votes"), list) else []
+    for item in votes:
+        if not isinstance(item, dict):
+            continue
+        lines.append(
+            f"| {item.get('parser')} | {item.get('eligible')} | {item.get('vote_score', 0)} | "
+            f"{item.get('quality_score', '')} | {item.get('consensus_score', '')} | "
+            f"{item.get('coverage_score', '')} | {item.get('structure_score', '')} | "
+            f"{item.get('repetition_score', '')} | {item.get('invoice_score', '')} | "
+            f"{item.get('penalty', '')} | {item.get('chars', '')} | {item.get('seconds', '')} |"
+        )
+
+    diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), list) else []
+    lines.extend(["", "## Diagnostics", ""])
+    for item in diagnostics:
+        lines.append(f"- {item}")
+    return "\n".join(lines) + "\n"
+
+
+def write_vote_outputs(
+    payload: dict[str, object],
+    normalized_texts: dict[str, str],
+    out_dir: Path,
+    output_format: str,
+) -> list[Path]:
+    """Write vote reports and best raw text output files."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    report_json = write_json_file(out_dir / "vote_report.json", payload)
+    report_md = out_dir / "vote_report.md"
+    report_md.write_text(vote_to_markdown(payload), encoding="utf-8")
+    written.extend([report_json, report_md])
+
+    winner = payload.get("winner") if isinstance(payload.get("winner"), dict) else None
+    winner_parser = str(winner.get("parser")) if winner else ""
+    best_text = normalized_texts.get(winner_parser, "")
+    if not best_text:
+        return written
+
+    suffixes = output_suffixes(output_format)
+    for suffix in suffixes:
+        path = out_dir / f"best.{suffix}"
+        if suffix in ("md", "txt"):
+            path.write_text(best_text + "\n", encoding="utf-8")
+        elif suffix == "json":
+            payload_json = {
+                "version": __version__,
+                "type": "customer_best_text",
+                "parser": winner_parser,
+                "source_file": payload.get("source_file"),
+                "vote_score": winner.get("vote_score") if winner else None,
+                "quality_score": winner.get("quality_score") if winner else None,
+                "text": best_text,
+            }
+            write_json_file(path, payload_json)
+        written.append(path)
+    return written
+
+
+def customer_value(value: object) -> str:
+    """Format structured values for customer-facing text."""
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        return f"{value:.2f}"
+    return str(value).replace("|", "\\|").strip()
+
+
+INVOICE_CONFIDENCE_FIELDS = [
+    "invoice_type",
+    "invoice_number",
+    "invoice_date",
+    "buyer_name",
+    "buyer_tax_id",
+    "seller_name",
+    "seller_tax_id",
+    "total_amount",
+    "total_tax",
+    "total_with_tax",
+    "total_with_tax_cn",
+    "drawer",
+]
+
+
+def normalize_field_value(value: object) -> str:
+    """Normalize structured field values for cross-parser comparison."""
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        return f"{value:.2f}"
+    return re.sub(r"\s+", "", str(value))
+
+
+def estimate_field_page(text: str, value: object) -> int | None:
+    """Estimate the page where a field value appears from page markers."""
+    value_text = normalize_field_value(value)
+    if not value_text:
+        return None
+    compact = compact_text(text)
+    pos = compact.find(value_text)
+    if pos < 0:
+        return None
+    prefix = text[: min(len(text), pos + 200)]
+    markers = re.findall(r"<!--\s*page\s+(\d+)", prefix, flags=re.IGNORECASE)
+    if markers:
+        try:
+            return int(markers[-1])
+        except ValueError:
+            return None
+    return 1
+
+
+def build_field_confidence(payload: dict[str, object], normalized_texts: dict[str, str]) -> dict[str, object]:
+    """Build field-level confidence from invoice vote candidates."""
+    winner = payload.get("winner") if isinstance(payload.get("winner"), dict) else {}
+    winner_parser = str(winner.get("parser") or "")
+    votes = payload.get("votes") if isinstance(payload.get("votes"), list) else []
+    parser_fields: dict[str, dict[str, object]] = {}
+    for vote in votes:
+        if not isinstance(vote, dict) or not vote.get("eligible"):
+            continue
+        fields = vote.get("invoice_fields") if isinstance(vote.get("invoice_fields"), dict) else None
+        if fields:
+            parser_fields[str(vote.get("parser"))] = fields
+    parser_count = max(1, len(parser_fields))
+    winner_fields = parser_fields.get(winner_parser, {})
+    confidence: dict[str, object] = {}
+    for field in INVOICE_CONFIDENCE_FIELDS:
+        winning_value = winner_fields.get(field)
+        normalized_winning = normalize_field_value(winning_value)
+        sources: list[dict[str, object]] = []
+        support = 0
+        for parser_name, fields in parser_fields.items():
+            value = fields.get(field)
+            normalized_value = normalize_field_value(value)
+            if not normalized_value:
+                continue
+            same = normalized_winning and normalized_value == normalized_winning
+            if same:
+                support += 1
+            text = normalized_texts.get(parser_name, "")
+            sources.append({
+                "parser": parser_name,
+                "value": value,
+                "matches_winner": bool(same),
+                "page": estimate_field_page(text, value),
+                "bbox": None,
+                "confidence": round(1.0 if same else 0.55, 4),
+            })
+        base_confidence = support / parser_count if normalized_winning else 0.0
+        if normalized_winning and winner_parser in parser_fields:
+            base_confidence = min(1.0, base_confidence + 0.12)
+        confidence[field] = {
+            "value": winning_value,
+            "source_parser": winner_parser if normalized_winning else None,
+            "support_count": support,
+            "parser_count": parser_count,
+            "confidence": round(base_confidence, 4),
+            "page": estimate_field_page(normalized_texts.get(winner_parser, ""), winning_value),
+            "bbox": None,
+            "sources": sources,
+        }
+    return confidence
+
+
+def build_customer_invoice_delivery(
+    payload: dict[str, object],
+    normalized_texts: dict[str, str] | None = None,
+) -> dict[str, object] | None:
+    """Build a clean structured invoice payload from the winning vote."""
+    winner = payload.get("winner") if isinstance(payload.get("winner"), dict) else None
+    if not winner:
+        return None
+    fields = winner.get("invoice_fields") if isinstance(winner.get("invoice_fields"), dict) else None
+    if not fields:
+        return None
+    normalized_texts = normalized_texts or {}
+    return {
+        "version": __version__,
+        "type": "customer_invoice_delivery",
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "source_file": payload.get("source_file"),
+        "parser": winner.get("parser"),
+        "vote_score": winner.get("vote_score"),
+        "invoice_score": winner.get("invoice_score"),
+        "quality_score": winner.get("quality_score"),
+        "validation": fields.get("validation"),
+        "field_confidence": build_field_confidence(payload, normalized_texts),
+        "invoice": {
+            "invoice_type": fields.get("invoice_type"),
+            "invoice_number": fields.get("invoice_number"),
+            "invoice_date": fields.get("invoice_date"),
+            "buyer_name": fields.get("buyer_name"),
+            "buyer_tax_id": fields.get("buyer_tax_id"),
+            "seller_name": fields.get("seller_name"),
+            "seller_tax_id": fields.get("seller_tax_id"),
+            "total_amount": fields.get("total_amount"),
+            "total_tax": fields.get("total_tax"),
+            "total_with_tax": fields.get("total_with_tax"),
+            "total_with_tax_cn": fields.get("total_with_tax_cn"),
+            "drawer": fields.get("drawer"),
+            "items": fields.get("items") if isinstance(fields.get("items"), list) else [],
+        },
+        "audit": {
+            "profile": payload.get("profile"),
+            "weights": payload.get("weights"),
+            "winner": {
+                key: winner.get(key)
+                for key in [
+                    "parser",
+                    "vote_score",
+                    "quality_score",
+                    "consensus_score",
+                    "coverage_score",
+                    "structure_score",
+                    "repetition_score",
+                    "invoice_score",
+                    "penalty",
+                ]
+            },
+        },
+    }
+
+
+def customer_invoice_to_markdown(delivery: dict[str, object]) -> str:
+    """Render customer invoice delivery as Markdown."""
+    invoice = delivery.get("invoice") if isinstance(delivery.get("invoice"), dict) else {}
+    validation = delivery.get("validation") if isinstance(delivery.get("validation"), dict) else {}
+    lines = [
+        "# 发票解析结果",
+        "",
+        f"- 来源文件：`{delivery.get('source_file')}`",
+        f"- 推荐解析器：`{delivery.get('parser')}`",
+        f"- 投票得分：`{delivery.get('vote_score')}`",
+        f"- 发票校验：`{validation.get('status')}`",
+        "",
+        "## 基本信息",
+        "",
+        "| 字段 | 值 |",
+        "|---|---|",
+    ]
+    labels = [
+        ("invoice_type", "发票类型"),
+        ("invoice_number", "发票号码"),
+        ("invoice_date", "开票日期"),
+        ("buyer_name", "购买方名称"),
+        ("buyer_tax_id", "购买方税号"),
+        ("seller_name", "销售方名称"),
+        ("seller_tax_id", "销售方税号"),
+        ("total_amount", "合计金额"),
+        ("total_tax", "合计税额"),
+        ("total_with_tax", "价税合计"),
+        ("total_with_tax_cn", "价税合计大写"),
+        ("drawer", "开票人"),
+    ]
+    for key, label in labels:
+        lines.append(f"| {label} | {customer_value(invoice.get(key))} |")
+
+    field_confidence = delivery.get("field_confidence") if isinstance(delivery.get("field_confidence"), dict) else {}
+    if field_confidence:
+        lines.extend(["", "## 字段置信度", "", "| 字段 | 来源解析器 | 置信度 | 支持数 | 页码 |", "|---|---|---:|---:|---:|"])
+        for key, label in labels:
+            info = field_confidence.get(key) if isinstance(field_confidence.get(key), dict) else {}
+            lines.append(
+                f"| {label} | {customer_value(info.get('source_parser'))} | "
+                f"{customer_value(info.get('confidence'))} | {customer_value(info.get('support_count'))}/{customer_value(info.get('parser_count'))} | "
+                f"{customer_value(info.get('page'))} |"
+            )
+
+    lines.extend(["", "## 明细", ""])
+    items = invoice.get("items") if isinstance(invoice.get("items"), list) else []
+    if items:
+        lines.extend([
+            "| 项目名称 | 单位 | 数量 | 单价 | 金额 | 税率 | 税额 |",
+            "|---|---|---:|---:|---:|---:|---:|",
+        ])
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"| {customer_value(item.get('name'))} | {customer_value(item.get('unit'))} | "
+                f"{customer_value(item.get('quantity'))} | {customer_value(item.get('unit_price'))} | "
+                f"{customer_value(item.get('amount'))} | {customer_value(item.get('tax_rate'))} | "
+                f"{customer_value(item.get('tax_amount'))} |"
+            )
+    else:
+        lines.append("未抽取到明细。")
+
+    checks = validation.get("checks") if isinstance(validation.get("checks"), list) else []
+    if checks:
+        lines.extend(["", "## 校验", "", "| 检查项 | 结果 | 期望 | 实际 |", "|---|---:|---|---|"])
+        for check in checks:
+            if not isinstance(check, dict):
+                continue
+            lines.append(
+                f"| {customer_value(check.get('name'))} | {customer_value(check.get('passed'))} | "
+                f"{customer_value(check.get('expected'))} | {customer_value(check.get('actual'))} |"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def customer_invoice_to_txt(delivery: dict[str, object]) -> str:
+    """Render customer invoice delivery as plain text."""
+    invoice = delivery.get("invoice") if isinstance(delivery.get("invoice"), dict) else {}
+    validation = delivery.get("validation") if isinstance(delivery.get("validation"), dict) else {}
+    labels = [
+        ("invoice_type", "发票类型"),
+        ("invoice_number", "发票号码"),
+        ("invoice_date", "开票日期"),
+        ("buyer_name", "购买方名称"),
+        ("buyer_tax_id", "购买方税号"),
+        ("seller_name", "销售方名称"),
+        ("seller_tax_id", "销售方税号"),
+        ("total_amount", "合计金额"),
+        ("total_tax", "合计税额"),
+        ("total_with_tax", "价税合计"),
+        ("total_with_tax_cn", "价税合计大写"),
+        ("drawer", "开票人"),
+    ]
+    lines = [
+        "发票解析结果",
+        f"来源文件: {delivery.get('source_file')}",
+        f"推荐解析器: {delivery.get('parser')}",
+        f"投票得分: {delivery.get('vote_score')}",
+        f"发票校验: {validation.get('status')}",
+        "",
+        "基本信息",
+    ]
+    for key, label in labels:
+        lines.append(f"{label}: {customer_value(invoice.get(key))}")
+    field_confidence = delivery.get("field_confidence") if isinstance(delivery.get("field_confidence"), dict) else {}
+    if field_confidence:
+        lines.extend(["", "字段置信度"])
+        for key, label in labels:
+            info = field_confidence.get(key) if isinstance(field_confidence.get(key), dict) else {}
+            lines.append(
+                f"{label}: 置信度 {customer_value(info.get('confidence'))}, "
+                f"来源 {customer_value(info.get('source_parser'))}, "
+                f"支持 {customer_value(info.get('support_count'))}/{customer_value(info.get('parser_count'))}, "
+                f"页码 {customer_value(info.get('page'))}"
+            )
+    lines.extend(["", "明细"])
+    items = invoice.get("items") if isinstance(invoice.get("items"), list) else []
+    if items:
+        for index, item in enumerate(items, 1):
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{index}. {customer_value(item.get('name'))} | 单位 {customer_value(item.get('unit'))} | "
+                f"数量 {customer_value(item.get('quantity'))} | 单价 {customer_value(item.get('unit_price'))} | "
+                f"金额 {customer_value(item.get('amount'))} | 税率 {customer_value(item.get('tax_rate'))} | "
+                f"税额 {customer_value(item.get('tax_amount'))}"
+            )
+    else:
+        lines.append("未抽取到明细。")
+    return "\n".join(lines) + "\n"
+
+
+def build_customer_text_delivery(
+    payload: dict[str, object],
+    normalized_texts: dict[str, str],
+) -> dict[str, object] | None:
+    """Build a generic customer payload when no structured profile is active."""
+    winner = payload.get("winner") if isinstance(payload.get("winner"), dict) else None
+    if not winner:
+        return None
+    winner_parser = str(winner.get("parser") or "")
+    text = normalized_texts.get(winner_parser, "")
+    if not text:
+        return None
+    return {
+        "version": __version__,
+        "type": "customer_best_text",
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "source_file": payload.get("source_file"),
+        "parser": winner_parser,
+        "vote_score": winner.get("vote_score"),
+        "quality_score": winner.get("quality_score"),
+        "text": text,
+    }
+
+
+def write_customer_outputs(
+    payload: dict[str, object],
+    normalized_texts: dict[str, str],
+    out_dir: Path,
+    output_format: str,
+) -> list[Path]:
+    """Write customer_best.* outputs from structured fields when available."""
+    profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else {}
+    delivery: dict[str, object] | None = None
+    if profile.get("resolved") == "invoice":
+        delivery = build_customer_invoice_delivery(payload, normalized_texts)
+    if delivery is None:
+        delivery = build_customer_text_delivery(payload, normalized_texts)
+    if delivery is None:
+        return []
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    for suffix in output_suffixes(output_format):
+        path = out_dir / f"customer_best.{suffix}"
+        if suffix == "json":
+            write_json_file(path, delivery)
+        elif suffix == "md":
+            if delivery.get("type") == "customer_invoice_delivery":
+                path.write_text(customer_invoice_to_markdown(delivery), encoding="utf-8")
+            else:
+                path.write_text(str(delivery.get("text") or "") + "\n", encoding="utf-8")
+        elif suffix == "txt":
+            if delivery.get("type") == "customer_invoice_delivery":
+                path.write_text(customer_invoice_to_txt(delivery), encoding="utf-8")
+            else:
+                path.write_text(str(delivery.get("text") or "") + "\n", encoding="utf-8")
+        written.append(path)
+    return written
+
+
+def write_customer_pack_readme(manifest: dict[str, object], out_dir: Path) -> Path:
+    """Write a concise README for a customer delivery pack."""
+    outputs = manifest.get("outputs") if isinstance(manifest.get("outputs"), dict) else {}
+    vote = manifest.get("vote") if isinstance(manifest.get("vote"), dict) else {}
+    tables = manifest.get("tables") if isinstance(manifest.get("tables"), dict) else {}
+    layout = manifest.get("layout") if isinstance(manifest.get("layout"), dict) else {}
+    metadata = manifest.get("metadata") if isinstance(manifest.get("metadata"), dict) else {}
+    winner = vote.get("winner") if isinstance(vote.get("winner"), dict) else {}
+    lines = [
+        "# Customer PDF Pack",
+        "",
+        f"- Source: `{manifest.get('source_file')}`",
+        f"- Generated: `{manifest.get('generated_at')}`",
+        f"- Best parser: `{winner.get('parser')}`",
+        f"- Vote score: `{winner.get('vote_score')}`",
+        f"- Table count: `{tables.get('table_count', 0)}`",
+        f"- Layout pages: `{layout.get('page_count', 0)}`",
+        "",
+        "## Outputs",
+        "",
+    ]
+    for key, value in outputs.items():
+        if isinstance(value, list):
+            joined = ", ".join(f"`{item}`" for item in value)
+            lines.append(f"- `{key}`: {joined}")
+        elif value:
+            lines.append(f"- `{key}`: `{value}`")
+    diagnostics = manifest.get("diagnostics") if isinstance(manifest.get("diagnostics"), list) else []
+    if diagnostics:
+        lines.extend(["", "## Diagnostics", ""])
+        for item in diagnostics:
+            lines.append(f"- {item}")
+    if metadata:
+        lines.extend([
+            "",
+            "## Metadata Summary",
+            "",
+            f"- Format: `{metadata.get('format')}`",
+            f"- Size bytes: `{metadata.get('size_bytes')}`",
+        ])
+        pdf = metadata.get("pdf") if isinstance(metadata.get("pdf"), dict) else {}
+        if pdf:
+            lines.extend([
+                f"- PDF pages: `{pdf.get('page_count')}`",
+                f"- Has sample text layer: `{pdf.get('has_sample_text_layer')}`",
+            ])
+    readme_path = out_dir / "README.md"
+    readme_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return readme_path
+
+
+def write_customer_pdf_pack(
+    file_path: Path,
+    out_dir: Path,
+    parser_names: list[str],
+    start_page: int,
+    max_pages: int | None,
+    probe_max_pages: int | None,
+    table_pages: str,
+    layout_max_pages: int | None,
+    profile: str,
+    min_quality: float,
+    fail_on_bad: bool,
+    similarity_chars: int,
+    include_tables: bool = True,
+    include_layout: bool = True,
+    parallel: bool = False,
+    timeout_seconds: float | None = None,
+    health_cache_path: Path | None = None,
+    use_health_cache: bool = False,
+) -> dict[str, object]:
+    """Build a customer-facing PDF pack with text, vote, tables, layout, and metadata."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics: list[str] = []
+    written: list[Path] = []
+
+    metadata = file_metadata(file_path)
+    metadata_path = write_json_file(out_dir / "metadata.json", metadata)
+    written.append(metadata_path)
+
+    probe_dir = out_dir / "preflight_probe"
+    preflight_probe, probe_written = run_parser_probe(
+        file_path,
+        "pdf",
+        parser_names,
+        probe_dir,
+        start_page,
+        probe_max_pages,
+        min_quality,
+        fail_on_bad,
+        parallel,
+        keep_outputs=False,
+        progress=True,
+        timeout_seconds=timeout_seconds,
+        health_cache_path=health_cache_path,
+        use_health_cache=use_health_cache,
+    )
+    written.extend(probe_written)
+    ready_parser_names = ready_parsers_from_probe(preflight_probe)
+    if not ready_parser_names:
+        raise RuntimeError("预检没有解析器通过运行时体检")
+
+    results, normalized_texts, actual_path = collect_parser_outputs(
+        file_path,
+        "pdf",
+        ready_parser_names,
+        out_dir,
+        "md",
+        start_page,
+        max_pages,
+        parallel,
+        progress=True,
+        timeout_seconds=timeout_seconds,
+        health_cache_path=health_cache_path,
+        use_health_cache=use_health_cache,
+    )
+    vote_payload = build_vote_payload(
+        file_path,
+        actual_path,
+        "pdf",
+        results,
+        normalized_texts,
+        similarity_chars,
+        min_quality,
+        fail_on_bad,
+        profile,
+        preflight_probe,
+    )
+    vote_written = write_vote_outputs(vote_payload, normalized_texts, out_dir, "all")
+    customer_written = write_customer_outputs(vote_payload, normalized_texts, out_dir, "all")
+    written.extend(vote_written)
+    written.extend(customer_written)
+
+    tables_payload: dict[str, object] = {"enabled": include_tables, "table_count": 0, "outputs": {}, "error": None}
+    if include_tables:
+        try:
+            page_count = get_pdf_page_count(file_path)
+            page_indices = resolve_page_indices(table_pages, page_count, default_all=True)
+            tables_dir = out_dir / "tables"
+            table_vote = build_table_vote_payload(
+                file_path,
+                page_indices,
+                ["pdfplumber", "pdfplumber-text", "pymupdf-text"],
+            )
+            table_written = write_table_vote_outputs(table_vote, tables_dir, "all")
+            written.extend(table_written)
+            tables = table_vote.get("best_tables") if isinstance(table_vote.get("best_tables"), list) else []
+            tables_payload = {
+                "enabled": True,
+                "page_count": len(page_indices),
+                "table_count": len(tables),
+                "winner": table_vote.get("winner"),
+                "outputs": {
+                    "vote_report": str(tables_dir / "table_vote_report.md"),
+                    "vote_report_json": str(tables_dir / "table_vote_report.json"),
+                    "md": str(tables_dir / "best_tables.md"),
+                    "csv": str(tables_dir / "best_tables.csv"),
+                    "json": str(tables_dir / "best_tables.json"),
+                },
+                "error": None,
+            }
+        except Exception as exc:
+            diagnostics.append(f"Table extraction failed: {exc!r}")
+            tables_payload = {"enabled": True, "table_count": 0, "outputs": {}, "error": repr(exc)}
+
+    layout_payload: dict[str, object] = {"enabled": include_layout, "page_count": 0, "output": None, "error": None}
+    if include_layout:
+        try:
+            layout = pdf_layout_json(file_path, start_page, layout_max_pages)
+            layout_path = write_json_file(out_dir / "layout.json", layout)
+            page_map_path = write_json_file(out_dir / "page_map.json", layout_to_page_map(layout))
+            written.extend([layout_path, page_map_path])
+            pages = layout.get("pages") if isinstance(layout.get("pages"), list) else []
+            layout_payload = {
+                "enabled": True,
+                "page_count": len(pages),
+                "output": str(layout_path),
+                "page_map": str(page_map_path),
+                "error": None,
+            }
+        except Exception as exc:
+            diagnostics.append(f"Layout extraction failed: {exc!r}")
+            layout_payload = {"enabled": True, "page_count": 0, "output": None, "error": repr(exc)}
+
+    winner = vote_payload.get("winner") if isinstance(vote_payload.get("winner"), dict) else {}
+    manifest = {
+        "version": __version__,
+        "type": "customer-pdf-pack",
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "source_file": str(file_path),
+        "actual_file": str(actual_path),
+        "profile": profile,
+        "start_page": start_page,
+        "max_pages": max_pages,
+        "metadata": metadata,
+        "vote": {
+            "winner": winner,
+            "quality_gate": vote_payload.get("quality_gate"),
+            "ready_parsers": ready_parser_names,
+        },
+        "tables": tables_payload,
+        "layout": layout_payload,
+        "diagnostics": diagnostics,
+        "outputs": {
+            "metadata": str(metadata_path),
+            "manifest": str(out_dir / "manifest.json"),
+            "readme": str(out_dir / "README.md"),
+            "vote_report": str(out_dir / "vote_report.md"),
+            "vote_report_json": str(out_dir / "vote_report.json"),
+            "best": [str(out_dir / f"best.{suffix}") for suffix in ["md", "txt", "json"]],
+            "customer_best": [str(out_dir / f"customer_best.{suffix}") for suffix in ["md", "txt", "json"] if (out_dir / f"customer_best.{suffix}").exists()],
+            "preflight_probe": str(probe_dir / "probe_report.md"),
+            "tables": tables_payload.get("outputs"),
+            "layout": layout_payload.get("output"),
+            "page_map": layout_payload.get("page_map"),
+        },
+    }
+    manifest_path = write_json_file(out_dir / "manifest.json", manifest)
+    readme_path = write_customer_pack_readme(manifest, out_dir)
+    manifest["outputs"]["manifest"] = str(manifest_path)
+    manifest["outputs"]["readme"] = str(readme_path)
+    write_json_file(manifest_path, manifest)
+    return manifest
+
+
+def probe_status_for_result(
+    result: ParseResult,
+    dependency_available: bool,
+    min_quality: float,
+    fail_on_bad: bool,
+) -> dict[str, object]:
+    """Classify a parser after a real extraction probe."""
+    if not dependency_available:
+        return {
+            "status": "dependency_missing",
+            "ready": False,
+            "gate": quality_gate_status(None, min_quality, fail_on_bad),
+            "reason": "dependency_missing",
+        }
+    if result.status != "ok":
+        return {
+            "status": "runtime_failed",
+            "ready": False,
+            "gate": quality_gate_status(None, min_quality, fail_on_bad),
+            "reason": result.error or result.status,
+        }
+    gate = quality_gate_status(result, min_quality, fail_on_bad)
+    if not gate["passed"]:
+        return {
+            "status": "quality_failed",
+            "ready": False,
+            "gate": gate,
+            "reason": gate["reason"],
+        }
+    return {
+        "status": "ready",
+        "ready": True,
+        "gate": gate,
+        "reason": "ok",
+    }
+
+
+def build_probe_payload(
+    file_path: Path,
+    actual_path: Path,
+    fmt: str,
+    parser_names: list[str],
+    results: list[ParseResult],
+    normalized_texts: dict[str, str],
+    min_quality: float,
+    fail_on_bad: bool,
+    max_pages: int | None,
+    start_page: int,
+) -> dict[str, object]:
+    """Build a runtime parser probe report from actual extraction attempts."""
+    dependency_map = {
+        str(row.get("parser")): row
+        for row in parser_dependency_rows(fmt)
+    }
+    result_map = {result.parser: result for result in results}
+    rows: list[dict[str, object]] = []
+    ready_parsers: list[str] = []
+    diagnostics: list[str] = []
+
+    for parser_name in parser_names:
+        dependency = dependency_map.get(parser_name, {})
+        dependency_available = bool(dependency.get("available"))
+        result = result_map.get(parser_name)
+        if result is None:
+            result = ParseResult(
+                parser=parser_name,
+                status="skipped",
+                seconds=0.0,
+                error="parser did not run",
+            )
+        status = probe_status_for_result(result, dependency_available, min_quality, fail_on_bad)
+        text = normalized_texts.get(parser_name, "")
+        repetition = repetition_metrics(text) if text else None
+        row = {
+            "parser": parser_name,
+            "kind": dependency.get("kind"),
+            "dependency_available": dependency_available,
+            "commands": dependency.get("commands", []),
+            "modules": dependency.get("modules", []),
+            "runtime_status": result.status,
+            "probe_status": status["status"],
+            "ready": status["ready"],
+            "reason": status["reason"],
+            "seconds": result.seconds,
+            "quality_score": result.quality_score,
+            "quality_label": result.quality_label,
+            "chars": result.chars,
+            "non_space_chars": result.non_space_chars,
+            "chinese_chars": result.chinese_chars,
+            "cid_markers": result.cid_markers,
+            "control_chars": result.control_chars,
+            "repetition": repetition,
+            "output_file": result.output_file,
+            "error": result.error,
+            "quality_gate": status["gate"],
+            "preview": result.preview,
+        }
+        if row["ready"]:
+            ready_parsers.append(parser_name)
+        elif row["probe_status"] == "runtime_failed" and dependency_available:
+            diagnostics.append(f"{parser_name} dependency is available but the real extraction failed: {result.error}")
+        elif row["probe_status"] == "dependency_missing":
+            diagnostics.append(f"{parser_name} is registered but its dependency is missing.")
+        elif row["probe_status"] == "quality_failed":
+            diagnostics.append(f"{parser_name} ran but did not pass the quality gate ({status['reason']}).")
+        rows.append(row)
+
+    if not diagnostics:
+        diagnostics.append("All probed parsers passed the runtime quality gate.")
+
+    summary = {
+        "parser_count": len(parser_names),
+        "ready_count": len(ready_parsers),
+        "dependency_missing_count": sum(1 for row in rows if row["probe_status"] == "dependency_missing"),
+        "runtime_failed_count": sum(1 for row in rows if row["probe_status"] == "runtime_failed"),
+        "quality_failed_count": sum(1 for row in rows if row["probe_status"] == "quality_failed"),
+        "ready_parsers": ready_parsers,
+    }
+    return {
+        "version": __version__,
+        "type": "probe",
+        "source_file": str(file_path),
+        "actual_file": str(actual_path),
+        "format": fmt,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "start_page": start_page,
+        "max_pages": max_pages,
+        "min_quality": min_quality,
+        "fail_on_bad": fail_on_bad,
+        "summary": summary,
+        "diagnostics": diagnostics,
+        "rows": rows,
+        "results": [asdict(result) for result in results],
+    }
+
+
+def probe_to_markdown(payload: dict[str, object]) -> str:
+    """Render a runtime parser probe report."""
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
+    lines = [
+        "# Parser Runtime Probe",
+        "",
+        f"- Source: `{payload.get('source_file')}`",
+        f"- Format: `{payload.get('format')}`",
+        f"- Ready parsers: `{summary.get('ready_count', 0)}` / `{summary.get('parser_count', 0)}`",
+        f"- Dependency missing: `{summary.get('dependency_missing_count', 0)}`",
+        f"- Runtime failed: `{summary.get('runtime_failed_count', 0)}`",
+        f"- Quality failed: `{summary.get('quality_failed_count', 0)}`",
+        "",
+        "## Parsers",
+        "",
+        "| Parser | Probe | Dep | Runtime | Quality | Score | Chars | Time(s) | Reason |",
+        "|---|---|---:|---|---|---:|---:|---:|---|",
+    ]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        reason = str(row.get("reason") or row.get("error") or "").replace("|", "\\|")
+        lines.append(
+            f"| {row.get('parser')} | {row.get('probe_status')} | {row.get('dependency_available')} | "
+            f"{row.get('runtime_status')} | {row.get('quality_label')} | {row.get('quality_score')} | "
+            f"{row.get('chars')} | {row.get('seconds')} | {reason[:240]} |"
+        )
+
+    diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), list) else []
+    lines.extend(["", "## Diagnostics", ""])
+    for item in diagnostics:
+        lines.append(f"- {item}")
+    return "\n".join(lines) + "\n"
+
+
+def write_probe_outputs(payload: dict[str, object], out_dir: Path) -> tuple[Path, Path]:
+    """Write JSON and Markdown probe reports."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    json_path = write_json_file(out_dir / "probe_report.json", payload)
+    md_path = out_dir / "probe_report.md"
+    md_path.write_text(probe_to_markdown(payload), encoding="utf-8")
+    return json_path, md_path
+
+
+def run_parser_probe(
+    file_path: Path,
+    fmt: str,
+    parser_names: list[str],
+    out_dir: Path,
+    start_page: int,
+    max_pages: int | None,
+    min_quality: float,
+    fail_on_bad: bool,
+    parallel: bool = False,
+    keep_outputs: bool = False,
+    progress: bool = False,
+    timeout_seconds: float | None = None,
+    health_cache_path: Path | None = None,
+    use_health_cache: bool = False,
+) -> tuple[dict[str, object], list[Path]]:
+    """Run parser runtime probe and write probe reports."""
+    results, normalized_texts, actual_path = collect_parser_outputs(
+        file_path,
+        fmt,
+        parser_names,
+        out_dir,
+        "md" if keep_outputs else "txt",
+        start_page,
+        max_pages,
+        parallel,
+        progress=progress,
+        timeout_seconds=timeout_seconds,
+        health_cache_path=health_cache_path,
+        use_health_cache=use_health_cache,
+    )
+    payload = build_probe_payload(
+        file_path,
+        actual_path,
+        fmt,
+        parser_names,
+        results,
+        normalized_texts,
+        min_quality,
+        fail_on_bad,
+        max_pages,
+        start_page,
+    )
+    json_path, md_path = write_probe_outputs(payload, out_dir)
+    return payload, [json_path, md_path]
+
+
+def ready_parsers_from_probe(payload: dict[str, object]) -> list[str]:
+    """Return parsers that passed a probe payload."""
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    ready = summary.get("ready_parsers") if isinstance(summary.get("ready_parsers"), list) else []
+    return [str(name) for name in ready if name]
+
+
 def build_diagnostics(results: list[ParseResult]) -> list[str]:
     """Build concise diagnostics for extraction quality issues."""
     ok_results = [r for r in results if r.status == "ok"]
@@ -1608,6 +3651,21 @@ def opendataloader_install_hint(missing_python: list[str], missing_system: list[
     if missing_system:
         hints.append("install Java JDK/JRE and ensure java is on PATH")
     return "; ".join(hints) if hints else None
+
+
+def command_install_hint(missing_commands: list[str]) -> str | None:
+    """Build install hints for external command parsers."""
+    if not missing_commands:
+        return None
+    hints: list[str] = []
+    if any("@pspdfkit/pdf-to-markdown" in item for item in missing_commands):
+        hints.append(
+            "install Nutrient/PSPDFKit PDF to Markdown CLI: npm install -g @pspdfkit/pdf-to-markdown; "
+            "ensure pdf-to-markdown is on PATH. Official binaries currently target macOS/Linux."
+        )
+    other = [item for item in missing_commands if "@pspdfkit/pdf-to-markdown" not in item]
+    hints.extend(f"install external command for {item}" for item in other)
+    return "; ".join(hints)
 
 
 def ocr_pdf_pages(pdf_path: Path, page_indices: list[int], lang: str, dpi: int) -> list[dict[str, object]]:
@@ -1918,6 +3976,57 @@ def extract_invoice_items(text: str) -> list[dict[str, object]]:
     return items
 
 
+def invoice_item_repetition_metrics(items: object) -> dict[str, object]:
+    """Measure duplicate invoice line items after structured extraction."""
+    if not isinstance(items, list) or not items:
+        return {
+            "duplicate_item_ratio": 0.0,
+            "duplicate_item_count": 0,
+            "unique_item_count": 0,
+            "max_item_repeat": 0,
+            "penalty": 0.0,
+            "score": 1.0,
+        }
+
+    signatures: list[tuple[object, ...]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        signatures.append((
+            re.sub(r"\s+", "", str(item.get("name") or "")),
+            item.get("unit"),
+            item.get("quantity"),
+            item.get("unit_price"),
+            item.get("amount"),
+            item.get("tax_rate"),
+            item.get("tax_amount"),
+        ))
+
+    if not signatures:
+        return {
+            "duplicate_item_ratio": 0.0,
+            "duplicate_item_count": 0,
+            "unique_item_count": 0,
+            "max_item_repeat": 0,
+            "penalty": 0.0,
+            "score": 1.0,
+        }
+
+    counts = Counter(signatures)
+    duplicate_count = sum(count - 1 for count in counts.values() if count > 1)
+    duplicate_ratio = duplicate_count / max(1, len(signatures))
+    max_repeat = max(counts.values())
+    penalty = min(0.2, duplicate_ratio * 0.35 + max(0, max_repeat - 2) * 0.03)
+    return {
+        "duplicate_item_ratio": round(duplicate_ratio, 4),
+        "duplicate_item_count": duplicate_count,
+        "unique_item_count": len(counts),
+        "max_item_repeat": max_repeat,
+        "penalty": round(penalty, 4),
+        "score": round(max(0.0, 1.0 - penalty / 0.2), 4),
+    }
+
+
 def validate_invoice_fields(fields: dict[str, object], strict: bool = False) -> dict[str, object]:
     """Run invoice consistency checks."""
     required = [
@@ -1949,6 +4058,16 @@ def validate_invoice_fields(fields: dict[str, object], strict: bool = False) -> 
 
     items = fields.get("items")
     if isinstance(items, list) and items:
+        repetition = invoice_item_repetition_metrics(items)
+        if int(repetition.get("duplicate_item_count") or 0) > 0:
+            checks.append(
+                {
+                    "name": "line_items_not_repeated",
+                    "passed": False,
+                    "expected": "unique line items",
+                    "actual": repetition,
+                }
+            )
         item_amount = round(sum(float(item.get("amount") or 0.0) for item in items if isinstance(item, dict)), 2)
         item_tax = round(sum(float(item.get("tax_amount") or 0.0) for item in items if isinstance(item, dict)), 2)
         if isinstance(total_amount, float):
@@ -2097,7 +4216,12 @@ def classify_document(text: str, metadata: dict[str, object] | None = None) -> d
     """Classify documents for document-intelligence workflows."""
     scan = clean_invoice_scan_text(text)
     invoice_hits = sum(1 for token in ["发票号码", "开票日期", "购买方", "销售方", "价税合计", "税率"] if token in scan)
-    contract_hits = sum(1 for token in ["合同", "甲方", "乙方", "签订", "违约", "协议"] if token in scan)
+    contract_hits = sum(1 for token in ["合同", "甲方", "乙方", "签订", "违约", "协议", "履行期限", "争议解决"] if token in scan)
+    bank_statement_hits = sum(1 for token in ["银行流水", "交易日期", "借方", "贷方", "余额", "对方户名", "交易金额", "账户"] if token in scan)
+    quotation_hits = sum(1 for token in ["报价单", "报价", "单价", "含税", "有效期", "付款方式", "报价人"] if token in scan)
+    purchase_order_hits = sum(1 for token in ["采购订单", "采购单", "订单编号", "供应商", "采购方", "交货日期", "PO"] if token in scan)
+    report_hits = sum(1 for token in ["报告", "摘要", "结论", "数据分析", "指标", "图表", "附录"] if token in scan)
+    annual_report_hits = sum(1 for token in ["年度报告", "年报", "资产负债表", "利润表", "现金流量表", "董事会", "审计报告"] if token in scan)
     textbook_hits = sum(1 for token in ["目录", "第", "章", "练习", "考试", "知识点"] if token in scan)
     notice_hits = sum(1 for token in ["通知", "公告", "请", "附件", "日期"] if token in scan)
 
@@ -2111,7 +4235,12 @@ def classify_document(text: str, metadata: dict[str, object] | None = None) -> d
 
     scores = {
         "invoice": invoice_hits / 6,
-        "contract": contract_hits / 6,
+        "contract": contract_hits / 8,
+        "bank_statement": bank_statement_hits / 8,
+        "quotation": quotation_hits / 7,
+        "purchase_order": purchase_order_hits / 7,
+        "report": report_hits / 7,
+        "annual_report": annual_report_hits / 7,
         "textbook": textbook_hits / 6,
         "notice": notice_hits / 5,
     }
@@ -2131,7 +4260,12 @@ def classify_document(text: str, metadata: dict[str, object] | None = None) -> d
 
     strategy = {
         "invoice": "extract_fields_and_verify",
-        "contract": "chunk_with_page_references",
+        "contract": "extract_best_text_tables_and_key_terms",
+        "bank_statement": "extract_tables_and_preserve_transaction_rows",
+        "quotation": "extract_tables_and_price_terms",
+        "purchase_order": "extract_order_tables_and_supplier_terms",
+        "report": "extract_best_text_tables_and_summary_sections",
+        "annual_report": "extract_financial_tables_and_section_chunks",
         "textbook": "chunk_by_page_and_build_knowledge_pack",
         "notice": "extract_text_and_metadata",
         "scanned_pdf": "ocr_then_chunk",
@@ -2146,6 +4280,11 @@ def classify_document(text: str, metadata: dict[str, object] | None = None) -> d
         "signals": {
             "invoice_hits": invoice_hits,
             "contract_hits": contract_hits,
+            "bank_statement_hits": bank_statement_hits,
+            "quotation_hits": quotation_hits,
+            "purchase_order_hits": purchase_order_hits,
+            "report_hits": report_hits,
+            "annual_report_hits": annual_report_hits,
             "textbook_hits": textbook_hits,
             "notice_hits": notice_hits,
             "format": fmt,
@@ -2994,17 +5133,9 @@ def cmd_compare(args: argparse.Namespace) -> int:
         print(f"错误：不支持的文件格式：{file_path.suffix}。支持：{supported}", file=sys.stderr)
         return 1
 
-    available_parsers = get_parsers_for_format(fmt)
-    if args.parsers:
-        parser_names = [resolve_parser_name(n.strip().lower()) for n in args.parsers.split(",") if n.strip()]
-    else:
-        parser_names = available_parsers
-
-    valid_names = set(available_parsers)
-    unknown = [n for n in parser_names if n not in valid_names]
+    parser_names, unknown = validate_parser_selection(fmt, args.parsers)
     if unknown:
         print(f"警告：{fmt} 格式不支持以下解析器，将被跳过：{', '.join(unknown)}", file=sys.stderr)
-        parser_names = [n for n in parser_names if n in valid_names]
 
     if not parser_names:
         print("错误：没有可用的解析器", file=sys.stderr)
@@ -3016,83 +5147,400 @@ def cmd_compare(args: argparse.Namespace) -> int:
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    actual_path = file_path
-    temp_dir_obj: tempfile.TemporaryDirectory[str] | None = None
-    markitdown_skip_reason: str | None = None
-    if fmt == "pdf" and "markitdown" in parser_names:
-        temp_dir_obj = tempfile.TemporaryDirectory(prefix="parse_compare_")
-        actual_path, markitdown_skip_reason = prepare_markitdown_pdf_target(
-            file_path, start_page, max_pages, Path(temp_dir_obj.name)
-        )
-
-    def run_parser(name: str) -> tuple[ParseResult, str]:
-        if name == "markitdown" and markitdown_skip_reason:
-            return ParseResult(parser=name, status="skipped", seconds=0, error=markitdown_skip_reason), ""
-
-        extract_func = get_extractor(fmt, name)
-        if extract_func is None:
-            return ParseResult(parser=name, status="skipped", seconds=0, error=f"未注册的解析器：{name}"), ""
-
-        target = actual_path if (name == "markitdown" and fmt == "pdf") else file_path
-
-        start = time.perf_counter()
-        try:
-            raw_text = extract_func(target, start_page, max_pages)
-            out_file, normalized = write_extracted_outputs(out_dir, name, raw_text, args.output_format)
-            result = text_stats(name, "ok", time.perf_counter() - start, normalized, out_file)
-            return result, normalized
-        except Exception as exc:
-            result = ParseResult(
-                parser=name,
-                status="failed",
-                seconds=round(time.perf_counter() - start, 3),
-                error=repr(exc),
-            )
-            return result, ""
-
-    results: list[ParseResult] = []
-    normalized_texts: dict[str, str] = {}
-    try:
-        if args.parallel:
-            print("并行解析中...")
-            with ThreadPoolExecutor(max_workers=min(len(parser_names), 4)) as pool:
-                futures = {pool.submit(run_parser, name): name for name in parser_names}
-                for future in as_completed(futures):
-                    result, text = future.result()
-                    results.append(result)
-                    if text:
-                        normalized_texts[result.parser] = text
-                    icon = "OK" if result.status == "ok" else "FAIL" if result.status == "failed" else "SKIP"
-                    print(f"  [{icon}] {result.parser}: {result.chars} chars, {result.seconds}s")
-        else:
-            for name in parser_names:
-                print(f"解析中: {name}...", end=" ", flush=True)
-                result, text = run_parser(name)
-                results.append(result)
-                if text:
-                    normalized_texts[result.parser] = text
-                if result.status == "ok":
-                    print(f"OK {result.chars} chars, {result.seconds}s")
-                elif result.status == "failed":
-                    print(f"FAIL {result.error}")
-                else:
-                    print(f"SKIP {result.error}")
-
-        json_path, md_path = make_report(
-            file_path, actual_path, out_dir, fmt, max_pages, start_page,
-            results, normalized_texts, args.similarity_chars, args.output_format, args.ocr_fallback,
-            args.min_quality, args.fail_on_bad,
-        )
-        print(f"\n对比报告：{md_path}")
-        print(f"机器可读报告：{json_path}")
-    finally:
-        if temp_dir_obj:
-            temp_dir_obj.cleanup()
+    results, normalized_texts, actual_path = collect_parser_outputs(
+        file_path, fmt, parser_names, out_dir, args.output_format, start_page, max_pages, args.parallel, progress=True
+    )
+    json_path, md_path = make_report(
+        file_path, actual_path, out_dir, fmt, max_pages, start_page,
+        results, normalized_texts, args.similarity_chars, args.output_format, args.ocr_fallback,
+        args.min_quality, args.fail_on_bad,
+    )
+    print(f"\n对比报告：{md_path}")
+    print(f"机器可读报告：{json_path}")
 
     recommended = choose_recommended_result(results)
     gate = quality_gate_status(recommended, args.min_quality, args.fail_on_bad)
     if gate["enabled"] and not gate["passed"]:
         print(f"质量门禁未通过：{gate['reason']}（best={gate['best_quality_score']} {gate['best_quality_label']}）", file=sys.stderr)
+        return 2
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# 子命令：vote（多解析器投票并输出客户交付文本）
+# ---------------------------------------------------------------------------
+
+def cmd_vote(args: argparse.Namespace) -> int:
+    file_path = args.file.resolve()
+    out_dir = args.out_dir.resolve() if args.out_dir else file_path.parent / f"{file_path.stem}_vote_output"
+    max_pages = None if args.max_pages == 0 else args.max_pages
+    start_page = args.start_page
+
+    if not file_path.exists():
+        print(f"错误：文件不存在：{file_path}", file=sys.stderr)
+        return 1
+
+    fmt = detect_format(file_path)
+    if fmt is None:
+        supported = ", ".join(sorted(EXTENSION_FORMAT_MAP.keys()))
+        print(f"错误：不支持的文件格式：{file_path.suffix}。支持：{supported}", file=sys.stderr)
+        return 1
+    if fmt != "pdf":
+        print("错误：vote 当前用于 PDF 多解析器投票。其它格式请使用 auto/convert。", file=sys.stderr)
+        return 1
+
+    parser_names, unknown = validate_parser_selection(fmt, args.parsers)
+    if unknown:
+        print(f"警告：{fmt} 格式不支持以下解析器，将被跳过：{', '.join(unknown)}", file=sys.stderr)
+    if not parser_names:
+        print("错误：没有可用的解析器", file=sys.stderr)
+        return 1
+
+    print("PDF 投票解析")
+    print(f"输入：{file_path}")
+    print(f"解析器：{', '.join(parser_names)}")
+    print(f"Profile：{args.profile}")
+    print(f"输出目录：{out_dir}")
+
+    preflight_probe: dict[str, object] | None = None
+    preflight_written: list[Path] = []
+    health_cache_path = Path(args.health_cache).resolve() if args.health_cache else default_parser_health_cache_path(out_dir)
+    use_health_cache = bool(args.parser_health_cache)
+    if args.probe_before_vote:
+        probe_max_pages = None if args.probe_max_pages == 0 else args.probe_max_pages
+        probe_out_dir = out_dir / "preflight_probe"
+        print(f"预检体检：前 {args.probe_max_pages if args.probe_max_pages else '全量'} 页 -> {probe_out_dir}")
+        preflight_probe, preflight_written = run_parser_probe(
+            file_path,
+            fmt,
+            parser_names,
+            probe_out_dir,
+            start_page,
+            probe_max_pages,
+            args.probe_min_quality,
+            args.fail_on_bad,
+            args.parallel,
+            keep_outputs=False,
+            progress=True,
+            timeout_seconds=args.timeout,
+            health_cache_path=health_cache_path,
+            use_health_cache=use_health_cache,
+        )
+        ready_parser_names = ready_parsers_from_probe(preflight_probe)
+        if not ready_parser_names:
+            print("错误：预检没有解析器通过运行时体检，终止投票。", file=sys.stderr)
+            print(f"预检输出：{', '.join(str(path) for path in preflight_written)}")
+            return 2
+        skipped = [name for name in parser_names if name not in ready_parser_names]
+        if skipped:
+            print(f"预检剔除解析器：{', '.join(skipped)}")
+        parser_names = ready_parser_names
+        print(f"进入正式投票：{', '.join(parser_names)}")
+
+    results, normalized_texts, actual_path = collect_parser_outputs(
+        file_path,
+        fmt,
+        parser_names,
+        out_dir,
+        "md",
+        start_page,
+        max_pages,
+        args.parallel,
+        progress=True,
+        timeout_seconds=args.timeout,
+        health_cache_path=health_cache_path,
+        use_health_cache=use_health_cache,
+    )
+    payload = build_vote_payload(
+        file_path,
+        actual_path,
+        fmt,
+        results,
+        normalized_texts,
+        args.similarity_chars,
+        args.min_quality,
+        args.fail_on_bad,
+        args.profile,
+        preflight_probe,
+    )
+    written = write_vote_outputs(payload, normalized_texts, out_dir, args.format)
+    written.extend(preflight_written)
+    if args.customer:
+        written.extend(write_customer_outputs(payload, normalized_texts, out_dir, args.format))
+    winner = payload.get("winner") if isinstance(payload.get("winner"), dict) else None
+    if winner:
+        print(f"投票胜出：{winner.get('parser')}，得分：{winner.get('vote_score')}")
+    else:
+        print("没有可交付的解析结果", file=sys.stderr)
+    print(f"输出：{', '.join(str(path) for path in written)}")
+
+    gate = payload.get("quality_gate") if isinstance(payload.get("quality_gate"), dict) else {}
+    if not winner:
+        return 2
+    if gate.get("enabled") and not gate.get("passed"):
+        print(f"质量门禁未通过：{gate.get('reason')}", file=sys.stderr)
+        return 2
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# 子命令：customer-pack（复杂 PDF 客户交付包）
+# ---------------------------------------------------------------------------
+
+def cmd_customer_pack(args: argparse.Namespace) -> int:
+    file_path = args.file.resolve()
+    out_dir = args.out_dir.resolve() if args.out_dir else file_path.parent / f"{file_path.stem}_customer_pack"
+    max_pages = None if args.max_pages == 0 else args.max_pages
+    probe_max_pages = None if args.probe_max_pages == 0 else args.probe_max_pages
+    layout_max_pages = None if args.layout_max_pages == 0 else args.layout_max_pages
+
+    if not file_path.exists():
+        print(f"错误：文件不存在：{file_path}", file=sys.stderr)
+        return 1
+    if file_path.suffix.lower() != ".pdf":
+        print("错误：customer-pack 当前用于 PDF。其它格式请使用 auto/convert/knowledge-pack。", file=sys.stderr)
+        return 1
+
+    parser_names, unknown = validate_parser_selection("pdf", args.parsers)
+    if unknown:
+        print(f"警告：PDF 不支持以下解析器，将被跳过：{', '.join(unknown)}", file=sys.stderr)
+    if not parser_names:
+        print("错误：没有可用的解析器", file=sys.stderr)
+        return 1
+
+    print("PDF 客户交付包")
+    print(f"输入：{file_path}")
+    print(f"输出目录：{out_dir}")
+    print(f"解析器：{', '.join(parser_names)}")
+    print(f"Profile：{args.profile}")
+
+    try:
+        health_cache_path = Path(args.health_cache).resolve() if args.health_cache else default_parser_health_cache_path(out_dir)
+        manifest = write_customer_pdf_pack(
+            file_path,
+            out_dir,
+            parser_names,
+            args.start_page,
+            max_pages,
+            probe_max_pages,
+            args.table_pages,
+            layout_max_pages,
+            args.profile,
+            args.min_quality,
+            args.fail_on_bad,
+            args.similarity_chars,
+            include_tables=not args.no_tables,
+            include_layout=not args.no_layout,
+            parallel=args.parallel,
+            timeout_seconds=args.timeout,
+            health_cache_path=health_cache_path,
+            use_health_cache=bool(args.parser_health_cache),
+        )
+    except Exception as exc:
+        print(f"错误：customer-pack 失败：{exc}", file=sys.stderr)
+        return 1
+
+    outputs = manifest.get("outputs") if isinstance(manifest.get("outputs"), dict) else {}
+    vote = manifest.get("vote") if isinstance(manifest.get("vote"), dict) else {}
+    winner = vote.get("winner") if isinstance(vote.get("winner"), dict) else {}
+    tables = manifest.get("tables") if isinstance(manifest.get("tables"), dict) else {}
+    print(f"交付包：{out_dir}")
+    print(f"manifest：{outputs.get('manifest')}")
+    print(f"README：{outputs.get('readme')}")
+    print(f"最佳解析器：{winner.get('parser')}，得分：{winner.get('vote_score')}")
+    print(f"表格数：{tables.get('table_count', 0)}")
+    return 0
+
+
+def cmd_batch_customer_pack(args: argparse.Namespace) -> int:
+    """Build customer packs for every PDF in a directory and write a batch index."""
+    input_dir = Path(args.dir).resolve()
+    if not input_dir.exists() or not input_dir.is_dir():
+        print(f"错误：目录不存在：{input_dir}", file=sys.stderr)
+        return 1
+    extensions = parse_extensions(args.ext)
+    if ".pdf" not in extensions:
+        extensions.add(".pdf")
+    try:
+        files = collect_input_files(input_dir, extensions, args.recursive)
+    except Exception as exc:
+        print(f"错误：收集文件失败：{exc}", file=sys.stderr)
+        return 1
+    files = [path for path in files if path.suffix.lower() == ".pdf"]
+    if not files:
+        print("错误：目录下没有找到 PDF 文件", file=sys.stderr)
+        return 1
+
+    parser_names, unknown = validate_parser_selection("pdf", args.parsers)
+    if unknown:
+        print(f"警告：PDF 不支持以下解析器，将被跳过：{', '.join(unknown)}", file=sys.stderr)
+    if not parser_names:
+        print("错误：没有可用的解析器", file=sys.stderr)
+        return 1
+
+    out_dir = args.out_dir.resolve() if args.out_dir else input_dir / "customer_packs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    max_pages = None if args.max_pages == 0 else args.max_pages
+    probe_max_pages = None if args.probe_max_pages == 0 else args.probe_max_pages
+    layout_max_pages = None if args.layout_max_pages == 0 else args.layout_max_pages
+    health_cache_path = Path(args.health_cache).resolve() if args.health_cache else default_parser_health_cache_path(out_dir)
+
+    print("批量 PDF 客户交付包")
+    print(f"目录：{input_dir}")
+    print(f"文件数：{len(files)}")
+    print(f"输出目录：{out_dir}")
+
+    manifests: list[dict[str, object]] = []
+    failures: list[dict[str, object]] = []
+    for file_path in files:
+        print(f"customer-pack: {file_path.name}...", end=" ", flush=True)
+        try:
+            pack_dir = out_dir / file_path.stem
+            manifest = write_customer_pdf_pack(
+                file_path,
+                pack_dir,
+                parser_names,
+                args.start_page,
+                max_pages,
+                probe_max_pages,
+                args.table_pages,
+                layout_max_pages,
+                args.profile,
+                args.min_quality,
+                args.fail_on_bad,
+                args.similarity_chars,
+                include_tables=not args.no_tables,
+                include_layout=not args.no_layout,
+                parallel=args.parallel,
+                timeout_seconds=args.timeout,
+                health_cache_path=health_cache_path,
+                use_health_cache=bool(args.parser_health_cache),
+            )
+            manifests.append(manifest)
+            print("ok")
+        except Exception as exc:
+            failures.append({"source_file": str(file_path), "error": repr(exc)})
+            print(f"FAIL {exc}")
+
+    index = {
+        "version": __version__,
+        "type": "batch-customer-pack",
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "input_dir": str(input_dir),
+        "output_dir": str(out_dir),
+        "file_count": len(files),
+        "success_count": len(manifests),
+        "failure_count": len(failures),
+        "profile": args.profile,
+        "manifests": [
+            {
+                "source_file": manifest.get("source_file"),
+                "manifest": (manifest.get("outputs") if isinstance(manifest.get("outputs"), dict) else {}).get("manifest"),
+                "readme": (manifest.get("outputs") if isinstance(manifest.get("outputs"), dict) else {}).get("readme"),
+                "winner": (manifest.get("vote") if isinstance(manifest.get("vote"), dict) else {}).get("winner"),
+                "tables": manifest.get("tables"),
+            }
+            for manifest in manifests
+        ],
+        "failures": failures,
+    }
+    index_path = write_json_file(out_dir / "index.json", index)
+    md_lines = [
+        "# Batch Customer Pack Index",
+        "",
+        f"- Input directory: `{input_dir}`",
+        f"- Output directory: `{out_dir}`",
+        f"- Files: `{len(files)}`",
+        f"- Success: `{len(manifests)}`",
+        f"- Failed: `{len(failures)}`",
+        "",
+        "| Source | Manifest | Winner | Vote | Tables |",
+        "|---|---|---|---:|---:|",
+    ]
+    for item in index["manifests"]:
+        if not isinstance(item, dict):
+            continue
+        winner = item.get("winner") if isinstance(item.get("winner"), dict) else {}
+        tables = item.get("tables") if isinstance(item.get("tables"), dict) else {}
+        md_lines.append(
+            f"| {Path(str(item.get('source_file'))).name} | `{item.get('manifest')}` | "
+            f"{winner.get('parser')} | {winner.get('vote_score')} | {tables.get('table_count', 0)} |"
+        )
+    if failures:
+        md_lines.extend(["", "## Failures", ""])
+        for failure in failures:
+            md_lines.append(f"- `{failure.get('source_file')}`: {failure.get('error')}")
+    index_md = out_dir / "index.md"
+    index_md.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
+    print(f"索引：{index_path}")
+    print(f"索引 Markdown：{index_md}")
+    return 0 if not failures else 1
+
+
+# ---------------------------------------------------------------------------
+# 子命令：probe（真实文件解析器运行时体检）
+# ---------------------------------------------------------------------------
+
+def cmd_probe(args: argparse.Namespace) -> int:
+    file_path = args.file.resolve()
+    out_dir = args.out_dir.resolve() if args.out_dir else file_path.parent / f"{file_path.stem}_probe_output"
+    max_pages = None if args.max_pages == 0 else args.max_pages
+    start_page = args.start_page
+
+    if not file_path.exists():
+        print(f"错误：文件不存在：{file_path}", file=sys.stderr)
+        return 1
+
+    fmt = detect_format(file_path)
+    if fmt is None:
+        supported = ", ".join(sorted(EXTENSION_FORMAT_MAP.keys()))
+        print(f"错误：不支持的文件格式：{file_path.suffix}。支持：{supported}", file=sys.stderr)
+        return 1
+
+    available_parsers = get_parsers_for_format(fmt)
+    if args.parsers:
+        parser_names = [resolve_parser_name(n.strip().lower()) for n in args.parsers.split(",") if n.strip()]
+    else:
+        parser_names = available_parsers
+    unknown = [name for name in parser_names if name not in available_parsers]
+    if unknown:
+        print(f"警告：{fmt} 格式不支持以下解析器，将被跳过：{', '.join(unknown)}", file=sys.stderr)
+    parser_names = [name for name in parser_names if name in available_parsers]
+    if not parser_names:
+        print("错误：没有可探测的解析器", file=sys.stderr)
+        return 1
+
+    print("解析器运行时体检")
+    print(f"输入：{file_path}")
+    print(f"格式：{fmt}")
+    print(f"解析器：{', '.join(parser_names)}")
+    print(f"输出目录：{out_dir}")
+
+    health_cache_path = Path(args.health_cache).resolve() if args.health_cache else default_parser_health_cache_path(out_dir)
+    payload, _written = run_parser_probe(
+        file_path,
+        fmt,
+        parser_names,
+        out_dir,
+        start_page,
+        max_pages,
+        args.min_quality,
+        args.fail_on_bad,
+        args.parallel,
+        keep_outputs=args.keep_outputs,
+        progress=True,
+        timeout_seconds=args.timeout,
+        health_cache_path=health_cache_path,
+        use_health_cache=bool(args.parser_health_cache),
+    )
+    json_path, md_path = out_dir / "probe_report.json", out_dir / "probe_report.md"
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    print(f"可用解析器：{summary.get('ready_count')}/{summary.get('parser_count')} -> {', '.join(summary.get('ready_parsers', []))}")
+    print(f"体检报告：{md_path}")
+    print(f"机器可读报告：{json_path}")
+
+    if args.fail_on_bad and int(summary.get("ready_count") or 0) == 0:
+        print("质量门禁未通过：没有解析器通过运行时体检", file=sys.stderr)
         return 2
     return 0
 
@@ -3148,9 +5596,9 @@ def cmd_convert(args: argparse.Namespace) -> int:
     temp_dir_obj: tempfile.TemporaryDirectory[str] | None = None
     try:
         target_path = file_path
-        if fmt == "pdf" and parser_name == "markitdown":
+        if fmt == "pdf" and parser_name in PDF_SUBSET_TARGET_PARSERS:
             temp_dir_obj = tempfile.TemporaryDirectory(prefix="parse_convert_")
-            target_path, skip_reason = prepare_markitdown_pdf_target(
+            target_path, skip_reason = prepare_pdf_subset_target(
                 file_path, start_page, max_pages, Path(temp_dir_obj.name)
             )
             if skip_reason:
@@ -3278,7 +5726,7 @@ def choose_scan_parser(fmt: str, requested_parser: str) -> str | None:
         return requested if requested in available else None
 
     preferences = {
-        "pdf": ["pymupdf", "pdfplumber", "pypdf", "pdfminer", "markitdown", "liteparse"],
+        "pdf": ["pymupdf", "pdfplumber", "pypdf", "pdfminer", "pymupdf4llm", "markitdown", "liteparse"],
         "word": ["markitdown", "python-docx"],
         "ppt": ["markitdown", "python-pptx"],
         "excel": ["markitdown", "openpyxl"],
@@ -3372,9 +5820,9 @@ def scan_one_document(
     start = time.perf_counter()
     try:
         target_path = file_path
-        if fmt == "pdf" and parser_name == "markitdown" and max_pages is not None:
+        if fmt == "pdf" and parser_name in PDF_SUBSET_TARGET_PARSERS and max_pages is not None:
             temp_dir_obj = tempfile.TemporaryDirectory(prefix="parse_scan_")
-            target_path, skip_reason = prepare_markitdown_pdf_target(
+            target_path, skip_reason = prepare_pdf_subset_target(
                 file_path, start_page, max_pages, Path(temp_dir_obj.name)
             )
             if skip_reason:
@@ -3650,13 +6098,68 @@ def cmd_tables(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_table_vote(args: argparse.Namespace) -> int:
+    """Run multiple table parsers and vote on the best table extraction."""
+    file_path = args.file.resolve()
+    if not file_path.exists():
+        print(f"错误：文件不存在：{file_path}", file=sys.stderr)
+        return 1
+    if file_path.suffix.lower() != ".pdf":
+        print("错误：table-vote 仅支持 PDF 文件", file=sys.stderr)
+        return 1
+    page_count = get_pdf_page_count(file_path)
+    page_indices = resolve_page_indices(args.pages, page_count, default_all=True)
+    methods = [item.strip() for item in args.methods.split(",") if item.strip()]
+    if not methods:
+        print("错误：没有表格解析器", file=sys.stderr)
+        return 1
+    out_dir = Path(args.out_dir).resolve() if args.out_dir else file_path.parent / f"{file_path.stem}_table_vote"
+    print("PDF 表格投票")
+    print(f"输入：{file_path}")
+    print(f"页数：{len(page_indices)}")
+    print(f"表格解析器：{', '.join(methods)}")
+    try:
+        payload = build_table_vote_payload(file_path, page_indices, methods)
+        written = write_table_vote_outputs(payload, out_dir, args.format)
+    except Exception as exc:
+        print(f"错误：table-vote 失败：{exc}", file=sys.stderr)
+        return 1
+    winner = payload.get("winner") if isinstance(payload.get("winner"), dict) else None
+    if winner:
+        print(f"表格胜出：{winner.get('method')}，得分：{winner.get('vote_score')}，表格数：{winner.get('table_count')}")
+    else:
+        print("未抽取到可交付表格")
+    print(f"输出：{', '.join(str(path) for path in written)}")
+    return 0 if winner else 2
+
+
 # ---------------------------------------------------------------------------
 # 子命令：doctor（依赖自检）
 # ---------------------------------------------------------------------------
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     rows = parser_dependency_rows(args.format)
-    missing_packages = sorted({str(row["package"]) for row in rows if not row["available"]})
+    missing_packages = sorted(
+        {
+            str(row["package"])
+            for row in rows
+            if not row["available"] and row.get("kind") == "python"
+        }
+    )
+    missing_commands = sorted(
+        {
+            str(row["package"])
+            for row in rows
+            if not row["available"] and row.get("kind") == "command"
+        }
+    )
+    missing_ocr_parser_packages = sorted(
+        {
+            str(row["package"])
+            for row in rows
+            if not row["available"] and row.get("kind") == "ocr"
+        }
+    )
     ocr_rows = OCR_DEPENDENCIES if getattr(args, "ocr", False) else []
     missing_ocr_python = [
         str(row["package"])
@@ -3687,6 +6190,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "format": args.format,
             "rows": rows,
             "missing_packages": missing_packages,
+            "missing_commands": missing_commands,
+            "missing_ocr_parser_packages": missing_ocr_parser_packages,
             "ocr_rows": ocr_rows,
             "missing_ocr_python_packages": missing_ocr_python,
             "missing_ocr_system_packages": missing_ocr_system,
@@ -3694,11 +6199,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "missing_opendataloader_python_packages": missing_opendataloader_python,
             "missing_opendataloader_system_packages": missing_opendataloader_system,
             "install_command": f"pip install {' '.join(missing_packages)}" if missing_packages else None,
+            "command_install_hint": command_install_hint(missing_commands),
             "ocr_install_hint": ocr_install_hint(missing_ocr_python, missing_ocr_system),
             "opendataloader_install_hint": opendataloader_install_hint(missing_opendataloader_python, missing_opendataloader_system),
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
-        strict_missing = missing_packages or missing_ocr_python or missing_ocr_system or missing_opendataloader_python or missing_opendataloader_system
+        strict_missing = (
+            missing_packages
+            or missing_commands
+            or missing_ocr_parser_packages
+            or missing_ocr_python
+            or missing_ocr_system
+            or missing_opendataloader_python
+            or missing_opendataloader_system
+        )
         return 1 if strict_missing and args.strict else 0
 
     print(f"parse_pdf_compare {__version__}")
@@ -3707,13 +6221,24 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print("| 格式 | 解析器 | 状态 | 模块 | 安装包 |")
     print("|---|---|---|---|---|")
     for row in rows:
-        modules = ", ".join(str(module) for module in row["modules"])
+        modules = ", ".join(str(module) for module in row["modules"]) or ", ".join(str(command) for command in row.get("commands", []))
         print(f"| {row['format']} | {row['parser']} | {row['status']} | {modules} | {row['package']} |")
 
     if missing_packages:
         print("")
         print("缺失依赖安装建议：")
         print(f"pip install {' '.join(missing_packages)}")
+
+    if missing_commands:
+        print("")
+        print("外部命令安装建议：")
+        print(command_install_hint(missing_commands))
+
+    if missing_ocr_parser_packages:
+        print("")
+        print("OCR parser 安装建议：")
+        print("pip install pymupdf pytesseract pillow")
+        print("并安装系统 Tesseract OCR、中文语言包（如 chi_sim），确保 tesseract 在 PATH 中。")
 
     if ocr_rows:
         print("")
@@ -3745,7 +6270,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             if missing_opendataloader_system:
                 print("需要系统安装 Java (JDK/JRE)，并确保 java 命令在 PATH 中。")
 
-    if missing_packages or missing_ocr_python or missing_ocr_system or missing_opendataloader_python or missing_opendataloader_system:
+    if missing_packages or missing_commands or missing_ocr_parser_packages or missing_ocr_python or missing_ocr_system or missing_opendataloader_python or missing_opendataloader_system:
         return 1 if args.strict else 0
 
     print("")
@@ -3820,9 +6345,9 @@ def cmd_chunk(args: argparse.Namespace) -> int:
 
     try:
         target_path = file_path
-        if fmt == "pdf" and parser_name == "markitdown":
+        if fmt == "pdf" and parser_name in PDF_SUBSET_TARGET_PARSERS:
             temp_dir_obj = tempfile.TemporaryDirectory(prefix="parse_chunk_")
-            target_path, skip_reason = prepare_markitdown_pdf_target(
+            target_path, skip_reason = prepare_pdf_subset_target(
                 file_path, start_page, max_pages, Path(temp_dir_obj.name)
             )
             if skip_reason:
@@ -4508,6 +7033,85 @@ def build_parser() -> argparse.ArgumentParser:
                            help="标记需要 OCR 回退；真实 OCR 请使用 ocr 子命令")
     p_compare.add_argument("--parallel", action="store_true", help="并行执行")
 
+    # --- vote ---
+    p_vote = subparsers.add_parser("vote", help="PDF 多解析器投票，输出客户可交付最佳文本")
+    p_vote.add_argument("file", type=Path, help="PDF 文件路径")
+    p_vote.add_argument("--out-dir", type=Path, default=None, help="输出目录（默认 <文件名>_vote_output）")
+    p_vote.add_argument("--max-pages", type=int, default=30, help="前 N 页，0=全量。默认 30")
+    p_vote.add_argument("--start-page", type=int, default=1, help="起始页。默认 1")
+    p_vote.add_argument("--parsers", default=None,
+                        help=f"逗号分隔解析器。默认全部 PDF 解析器：{','.join(get_parsers_for_format('pdf'))}")
+    p_vote.add_argument("--format", choices=sorted(TEXT_OUTPUT_FORMATS), default="md",
+                        help="客户交付 best 输出格式：md/txt/json/all。默认 md")
+    profile_choices = ["auto", "invoice", "contract", "bank_statement", "quotation", "purchase_order", "report", "annual_report", "none"]
+    p_vote.add_argument("--profile", choices=profile_choices, default="auto",
+                        help="投票领域加权 profile。invoice 会启用字段校验加权；其它业务 profile 用于分类/策略报告。默认 auto")
+    p_vote.add_argument("--customer", action="store_true",
+                        help="额外输出 customer_best.md/txt/json；发票 profile 下输出结构化客户交付稿")
+    p_vote.add_argument("--similarity-chars", type=int, default=50000, help="投票共识相似度比较字符数")
+    p_vote.add_argument("--min-quality", type=float, default=0.5, help="最低质量评分门槛，默认 0.5")
+    p_vote.add_argument("--fail-on-bad", action="store_true", help="胜出结果标签为 empty/bad 时返回退出码 2")
+    p_vote.add_argument("--probe-before-vote", action="store_true",
+                        help="正式投票前先用真实文件小样本体检解析器，只让 ready 解析器进入投票")
+    p_vote.add_argument("--probe-max-pages", type=int, default=1,
+                        help="--probe-before-vote 的体检页数，0=全量。默认 1")
+    p_vote.add_argument("--probe-min-quality", type=float, default=0.5,
+                        help="--probe-before-vote 的体检质量门槛。默认 0.5")
+    p_vote.add_argument("--timeout", type=float, default=None,
+                        help="单个解析器最大运行秒数；超时会杀掉子进程并标记 timeout。默认不限制")
+    p_vote.add_argument("--parser-health-cache", action="store_true",
+                        help="启用解析器健康缓存，跳过 24 小时内同文件同页段近期失败或超时的解析器")
+    p_vote.add_argument("--health-cache", default=None,
+                        help="解析器健康缓存 JSON 路径；默认输出目录下 .parser_health_cache.json")
+    p_vote.add_argument("--parallel", action="store_true", help="并行执行")
+
+    # --- customer-pack ---
+    p_pack_customer = subparsers.add_parser("customer-pack", help="复杂 PDF 客户交付包：最佳文本、表格、layout、metadata、manifest")
+    p_pack_customer.add_argument("file", type=Path, help="PDF 文件路径")
+    p_pack_customer.add_argument("--out-dir", type=Path, default=None, help="输出目录（默认 <文件名>_customer_pack）")
+    p_pack_customer.add_argument("--max-pages", type=int, default=0, help="正式文本投票页数，0=全量。默认 0")
+    p_pack_customer.add_argument("--start-page", type=int, default=1, help="起始页。默认 1")
+    p_pack_customer.add_argument("--probe-max-pages", type=int, default=1, help="预检体检页数，0=全量。默认 1")
+    p_pack_customer.add_argument("--table-pages", default="all", help="表格提取页码范围，如 1-5、1,3,5、all。默认 all")
+    p_pack_customer.add_argument("--layout-max-pages", type=int, default=30, help="layout 输出页数，0=全量。默认 30")
+    p_pack_customer.add_argument("--parsers", default=None,
+                                 help=f"逗号分隔解析器。默认全部 PDF 解析器：{','.join(get_parsers_for_format('pdf'))}")
+    p_pack_customer.add_argument("--profile", choices=profile_choices, default="auto",
+                                 help="投票领域加权 profile。invoice 会启用字段校验加权；其它业务 profile 用于分类/策略报告。默认 auto")
+    p_pack_customer.add_argument("--min-quality", type=float, default=0.5, help="最低质量评分门槛，默认 0.5")
+    p_pack_customer.add_argument("--fail-on-bad", action="store_true", help="胜出结果标签为 empty/bad 时返回退出码 2")
+    p_pack_customer.add_argument("--similarity-chars", type=int, default=50000, help="投票共识相似度比较字符数")
+    p_pack_customer.add_argument("--timeout", type=float, default=None,
+                                 help="单个解析器最大运行秒数；超时会杀掉子进程并标记 timeout。默认不限制")
+    p_pack_customer.add_argument("--parser-health-cache", action="store_true",
+                                 help="启用解析器健康缓存，跳过 24 小时内同文件同页段近期失败或超时的解析器")
+    p_pack_customer.add_argument("--health-cache", default=None,
+                                 help="解析器健康缓存 JSON 路径；默认输出目录下 .parser_health_cache.json")
+    p_pack_customer.add_argument("--no-tables", action="store_true", help="不提取 PDF 表格")
+    p_pack_customer.add_argument("--no-layout", action="store_true", help="不输出 layout.json/page_map.json")
+    p_pack_customer.add_argument("--parallel", action="store_true", help="并行执行解析器")
+
+    # --- probe ---
+    p_probe = subparsers.add_parser("probe", help="用真实文件逐个测试解析器运行状态")
+    p_probe.add_argument("file", type=Path, help="文件路径")
+    p_probe.add_argument("--out-dir", type=Path, default=None, help="输出目录（默认 <文件名>_probe_output）")
+    p_probe.add_argument("--max-pages", type=int, default=1, help="（仅 PDF）体检前 N 页，0=全量。默认 1")
+    p_probe.add_argument("--start-page", type=int, default=1, help="（仅 PDF）起始页。默认 1")
+    p_probe.add_argument("--parsers", default=None,
+                         help=f"逗号分隔解析器。默认当前格式全部注册解析器：{','.join(all_parsers)}")
+    p_probe.add_argument("--min-quality", type=float, default=0.5, help="最低质量评分门槛，默认 0.5")
+    p_probe.add_argument("--fail-on-bad", action="store_true",
+                         help="没有任何解析器通过运行时体检时返回退出码 2")
+    p_probe.add_argument("--keep-outputs", action="store_true",
+                         help="保留每个成功解析器的 Markdown 样本文本；默认写 txt 样本")
+    p_probe.add_argument("--timeout", type=float, default=None,
+                         help="单个解析器最大运行秒数；超时会杀掉子进程并标记 timeout。默认不限制")
+    p_probe.add_argument("--parser-health-cache", action="store_true",
+                         help="启用解析器健康缓存，跳过 24 小时内同文件同页段近期失败或超时的解析器")
+    p_probe.add_argument("--health-cache", default=None,
+                         help="解析器健康缓存 JSON 路径；默认输出目录下 .parser_health_cache.json")
+    p_probe.add_argument("--parallel", action="store_true", help="并行执行")
+
     # --- convert ---
     p_convert = subparsers.add_parser("convert", help="文档转指定格式")
     p_convert.add_argument("file", type=Path, help="文件路径")
@@ -4551,6 +7155,17 @@ def build_parser() -> argparse.ArgumentParser:
                           help="输出格式：md/csv/json/all。默认 md")
     p_tables.add_argument("-o", "--output", default=None,
                           help="输出文件路径；--format all 时为输出目录")
+
+    # --- table-vote ---
+    p_table_vote = subparsers.add_parser("table-vote", help="PDF 多表格解析器投票，输出最佳表格")
+    p_table_vote.add_argument("file", type=Path, help="PDF 文件路径")
+    p_table_vote.add_argument("--pages", default="all", help="页码范围，如 1-5、1,3,5、all。默认 all")
+    p_table_vote.add_argument("--methods", default="pdfplumber,pdfplumber-text,pymupdf-text",
+                              help="逗号分隔表格解析器：pdfplumber,pdfplumber-text,pymupdf-text")
+    p_table_vote.add_argument("--format", choices=["md", "csv", "json", "all"], default="all",
+                              help="最佳表格输出格式：md/csv/json/all。默认 all")
+    p_table_vote.add_argument("--out-dir", type=Path, default=None,
+                              help="输出目录（默认 <文件名>_table_vote）")
 
     # --- doctor ---
     p_doctor = subparsers.add_parser("doctor", help="检查解析器依赖是否可用")
@@ -4693,6 +7308,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_batch_pack.add_argument("--overlap", type=int, default=200, help="字符分块重叠。默认 200")
     p_batch_pack.add_argument("--min-quality", type=float, default=0.5, help="最低质量评分门槛，默认 0.5")
 
+    # --- batch-customer-pack ---
+    p_batch_customer = subparsers.add_parser("batch-customer-pack", help="批量生成 PDF 客户交付包并写总索引")
+    p_batch_customer.add_argument("dir", type=str, help="输入目录")
+    p_batch_customer.add_argument("--out-dir", type=Path, default=None, help="输出目录（默认 <目录>/customer_packs）")
+    p_batch_customer.add_argument("--ext", default=".pdf", help="扩展名，逗号分隔。默认 .pdf")
+    p_batch_customer.add_argument("--recursive", action="store_true", help="递归扫描目录")
+    p_batch_customer.add_argument("--max-pages", type=int, default=0, help="正式文本投票页数，0=全量。默认 0")
+    p_batch_customer.add_argument("--start-page", type=int, default=1, help="起始页。默认 1")
+    p_batch_customer.add_argument("--probe-max-pages", type=int, default=1, help="预检体检页数，0=全量。默认 1")
+    p_batch_customer.add_argument("--table-pages", default="all", help="表格提取页码范围，如 1-5、all。默认 all")
+    p_batch_customer.add_argument("--layout-max-pages", type=int, default=30, help="layout 输出页数，0=全量。默认 30")
+    p_batch_customer.add_argument("--parsers", default=None,
+                                  help=f"逗号分隔解析器。默认全部 PDF 解析器：{','.join(get_parsers_for_format('pdf'))}")
+    p_batch_customer.add_argument("--profile", choices=profile_choices, default="auto",
+                                  help="投票领域加权 profile。默认 auto")
+    p_batch_customer.add_argument("--min-quality", type=float, default=0.5, help="最低质量评分门槛，默认 0.5")
+    p_batch_customer.add_argument("--fail-on-bad", action="store_true", help="胜出结果标签为 empty/bad 时返回失败")
+    p_batch_customer.add_argument("--similarity-chars", type=int, default=50000, help="投票共识相似度比较字符数")
+    p_batch_customer.add_argument("--timeout", type=float, default=None,
+                                  help="单个解析器最大运行秒数；超时会杀掉子进程并标记 timeout。默认不限制")
+    p_batch_customer.add_argument("--parser-health-cache", action="store_true",
+                                  help="启用解析器健康缓存，跳过 24 小时内同文件同页段近期失败或超时的解析器")
+    p_batch_customer.add_argument("--health-cache", default=None,
+                                  help="解析器健康缓存 JSON 路径；默认输出目录下 .parser_health_cache.json")
+    p_batch_customer.add_argument("--no-tables", action="store_true", help="不提取 PDF 表格")
+    p_batch_customer.add_argument("--no-layout", action="store_true", help="不输出 layout.json/page_map.json")
+    p_batch_customer.add_argument("--parallel", action="store_true", help="并行执行解析器")
+
     # --- qa ---
     p_qa = subparsers.add_parser("qa", help="基于知识包、chunks 或文档执行本地抽取式问答")
     p_qa.add_argument("source", type=Path, help="知识包目录、chunks.jsonl/json 或文档路径")
@@ -4724,15 +7367,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    if len(sys.argv) > 2 and sys.argv[1] == "__extract-one":
+        return cmd_extract_one_internal(Path(sys.argv[2]))
+
     parser = build_parser()
 
     # 向后兼容：无子命令时等同于 compare
     if len(sys.argv) > 1 and sys.argv[1] not in (
-        "compare", "convert", "batch", "scan-dir", "tables", "doctor", "metadata",
+        "compare", "vote", "customer-pack", "batch-customer-pack", "probe", "convert", "batch", "scan-dir", "tables", "table-vote", "doctor", "metadata",
         "chunk", "render-pages", "ocr", "auto", "extract-fields", "export-xlsx",
         "layout-json", "verify-fields", "classify", "knowledge-pack", "batch-knowledge",
         "qa", "diff-docs",
-        "--version", "-h", "--help",
+        "--version", "-h", "--help", "__extract-one",
     ):
         sys.argv.insert(1, "compare")
 
@@ -4744,10 +7390,15 @@ def main() -> int:
 
     dispatch = {
         "compare": cmd_compare,
+        "vote": cmd_vote,
+        "customer-pack": cmd_customer_pack,
+        "batch-customer-pack": cmd_batch_customer_pack,
+        "probe": cmd_probe,
         "convert": cmd_convert,
         "batch": cmd_batch,
         "scan-dir": cmd_scan_dir,
         "tables": cmd_tables,
+        "table-vote": cmd_table_vote,
         "doctor": cmd_doctor,
         "metadata": cmd_metadata,
         "chunk": cmd_chunk,

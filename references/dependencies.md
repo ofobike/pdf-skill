@@ -7,12 +7,16 @@ Load this file only when diagnosing missing parser dependencies or preparing ins
 | Parser name | Python package | Typical formats |
 |---|---|---|
 | `markitdown` | `markitdown` | PDF, DOCX, PPTX, XLSX, HTML |
+| `pymupdf4llm` | `pymupdf4llm` | PDF to LLM/RAG-oriented Markdown |
+| `docling` | `docling` | PDF to structured document/Markdown |
+| `pspdfkit` | `@pspdfkit/pdf-to-markdown` CLI | PDF to Markdown via external Node CLI |
 | `pymupdf` | `pymupdf` | PDF |
 | `pypdf` | `pypdf` | PDF |
 | `pdfplumber` | `pdfplumber` | PDF text and tables |
 | `pdfminer` | `pdfminer.six` | PDF |
 | `liteparse` | `liteparse` | PDF |
 | `opendataloader` | `opendataloader-pdf` + Java | PDF |
+| `ocr-tesseract` | `pymupdf`, `pytesseract`, `pillow` + system Tesseract | PDF OCR parser for vote/probe/customer-pack |
 | `python-docx` | `python-docx` | DOCX |
 | `python-pptx` | `python-pptx` | PPTX |
 | `openpyxl` | `openpyxl` | XLSX |
@@ -20,7 +24,7 @@ Load this file only when diagnosing missing parser dependencies or preparing ins
 | `pytesseract` | `pytesseract` | OCR Python bridge |
 | `Pillow` | `pillow` | OCR image handoff |
 
-`ocr` also requires the system Tesseract OCR executable. Installing Python packages alone is not enough.
+`ocr` and the `ocr-tesseract` parser also require the system Tesseract OCR executable. Installing Python packages alone is not enough.
 Chinese OCR also requires matching Tesseract language data such as `chi_sim`.
 
 `opendataloader-pdf` requires both the Python wrapper/package and a working `java` command.
@@ -28,11 +32,14 @@ Chinese OCR also requires matching Tesseract language data such as `chi_sim`.
 ## Install Groups
 
 ```powershell
-pip install markitdown pymupdf pypdf pdfplumber pdfminer.six liteparse
+pip install markitdown pymupdf4llm docling pymupdf pypdf pdfplumber pdfminer.six liteparse
 pip install opendataloader-pdf
+npm install -g @pspdfkit/pdf-to-markdown
 pip install python-docx python-pptx openpyxl beautifulsoup4
 pip install pytesseract pillow
 ```
+
+`pspdfkit` is implemented as an external CLI parser. The command must be available as `pdf-to-markdown` or `pspdfkit-pdf-to-markdown` on PATH. Official binaries currently target macOS/Linux; Windows availability may lag.
 
 Do not install dependencies automatically unless the user explicitly asks.
 
