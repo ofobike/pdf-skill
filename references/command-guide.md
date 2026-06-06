@@ -17,8 +17,8 @@ Current exposed commands:
 | Command | Use |
 |---|---|
 | `compare` | Run multiple parsers against one file and create quality reports. |
-| `vote` | Run multiple PDF parsers, vote by quality/consensus/coverage/structure/repetition, and write best output. Supports invoice-weighted customer delivery, default field-level invoice fusion, optional field layout bbox matching, OCR parser voting, optional preflight parser probing, timeout, and parser health cache. |
-| `customer-pack` | Build a customer-ready PDF package with best text, optional customer fields, table voting, layout, metadata, manifest, vote report, and preflight report. |
+| `vote` | Run multiple PDF parsers, vote by quality/consensus/coverage/structure/repetition, and write best output. Supports invoice-weighted customer delivery, lightweight business profile fields, default field-level invoice fusion, optional field layout bbox matching, field evidence images, review HTML, OCR parser voting, optional preflight parser probing, timeout, parser health cache, and result cache. |
+| `customer-pack` | Build a customer-ready PDF package with best text, customer fields, customer JSON schema, field evidence images, review HTML, table voting, layout, metadata, manifest, vote report, and preflight report. |
 | `batch-customer-pack` | Build customer-ready PDF packages for a directory and write `index.json/index.md`. |
 | `probe` | Run real extraction smoke tests for registered parsers and report runtime readiness. |
 | `convert` | Convert one file to `md`, `txt`, `json`, or `all`. |
@@ -26,7 +26,8 @@ Current exposed commands:
 | `scan-dir` | Scan a directory for extraction quality and optional quality gates. |
 | `tables` | Extract PDF tables to `md`, `csv`, `json`, or `all`. |
 | `table-vote` | Run multiple table extractors and vote on the best table output. |
-| `eval-golden` | Run golden PDF case JSON files and detect parser voting regressions. |
+| `init-golden` | Initialize a Golden PDF case library from files or directories. |
+| `eval-golden` | Run golden PDF case JSON files and detect parser voting/text-quality regressions. |
 | `doctor` | Check parser, OCR, and opendataloader dependency availability. |
 | `metadata` | Extract metadata; PDFs include page count, embedded metadata, TOC preview, and text-layer hints. |
 | `chunk` | Split extracted text into `jsonl`, `json`, `md`, `txt`, or `all` by character or PDF page. |
@@ -70,18 +71,22 @@ python scripts\parse_document_compare.py compare "D:\path\file.pdf" --max-pages 
 python scripts\parse_document_compare.py vote "D:\path\file.pdf" --probe-before-vote --max-pages 3 --format all
 python scripts\parse_document_compare.py vote "D:\path\file.pdf" --probe-before-vote --max-pages 0 --format all --parsers markitdown,pymupdf4llm,docling,pymupdf,pdfplumber,ocr-tesseract --timeout 120 --parser-health-cache
 python scripts\parse_document_compare.py customer-pack "D:\path\file.pdf" --max-pages 0 --table-pages all --layout-max-pages 30
-python scripts\parse_document_compare.py batch-customer-pack "D:\docs" --recursive --max-pages 0 --table-pages all --layout-max-pages 30 --timeout 120 --parser-health-cache
+python scripts\parse_document_compare.py customer-pack "D:\path\file.pdf" --max-pages 0 --table-pages all --layout-max-pages 30 --timeout 120 --parser-health-cache --result-cache
+python scripts\parse_document_compare.py batch-customer-pack "D:\docs" --recursive --max-pages 0 --table-pages all --layout-max-pages 30 --timeout 120 --parser-health-cache --result-cache
 python scripts\parse_document_compare.py vote "D:\path\invoice.pdf" --probe-before-vote --max-pages 0 --format all --profile invoice --customer
 python scripts\parse_document_compare.py vote "D:\path\invoice.pdf" --probe-before-vote --max-pages 0 --format all --profile invoice --customer --field-layout --field-layout-max-pages 0
+python scripts\parse_document_compare.py vote "D:\path\invoice.pdf" --probe-before-vote --max-pages 0 --format all --profile invoice --customer --field-layout --field-layout-max-pages 0 --field-evidence --review-html
 python scripts\parse_document_compare.py vote "D:\path\invoice.pdf" --probe-before-vote --max-pages 0 --format all --profile invoice --customer --no-field-fusion
-python scripts\parse_document_compare.py probe "D:\path\file.pdf" --max-pages 1 --timeout 120 --parser-health-cache --keep-outputs
+python scripts\parse_document_compare.py vote "D:\path\contract.pdf" --probe-before-vote --max-pages 0 --format all --profile contract --customer --field-layout --field-evidence --review-html
+python scripts\parse_document_compare.py probe "D:\path\file.pdf" --max-pages 1 --timeout 120 --parser-health-cache --result-cache --keep-outputs
 python scripts\parse_document_compare.py compare "D:\path\file.pdf" --start-page 100 --max-pages 10 --output-format all
 python scripts\parse_document_compare.py convert "D:\path\file.docx" --parser markitdown --format json -o "D:\path\file.json"
 python scripts\parse_document_compare.py batch "D:\docs" --ext .pdf,.docx --parser markitdown --format txt
 python scripts\parse_document_compare.py scan-dir "D:\docs" --ext .pdf --max-pages 3 --min-quality 0.6 --fail-on-bad
 python scripts\parse_document_compare.py tables "D:\path\file.pdf" --pages 1-5 --format all
 python scripts\parse_document_compare.py table-vote "D:\path\file.pdf" --pages all --format all
-python scripts\parse_document_compare.py eval-golden "D:\path\golden_cases" --recursive --timeout 120 --parser-health-cache
+python scripts\parse_document_compare.py init-golden "D:\path\2022年上半年" "D:\path\模拟题库" --recursive --out-dir "D:\path\golden_cases" --max-pages 3 --include-ocr
+python scripts\parse_document_compare.py eval-golden "D:\path\golden_cases" --recursive --timeout 120 --parser-health-cache --result-cache
 python scripts\parse_document_compare.py metadata "D:\path\file.pdf" --format json
 python scripts\parse_document_compare.py chunk "D:\path\file.pdf" --parser pymupdf --format jsonl --chunk-size 2000 --overlap 200
 python scripts\parse_document_compare.py chunk "D:\path\file.pdf" --parser pymupdf --chunk-by page --format jsonl
@@ -112,11 +117,12 @@ python scripts\parse_document_compare.py compare "D:\path\file.pdf" --max-pages 
 
 Other command outputs:
 
-- `vote`: `vote_report.md`, `vote_report.json`, and `best.md`/`best.txt`/`best.json` depending on `--format`. With `--customer`, also writes `customer_best.md`/`customer_best.txt`/`customer_best.json`; with `--profile invoice`, those customer files contain structured invoice fields, validation results, `field_confidence`, and `audit.field_fusion`. Field-level fusion is enabled by default and can be disabled with `--no-field-fusion`. With `--field-layout`, it also writes `field_layout.json` and fills field `bbox/location` when layout matching succeeds. With `--probe-before-vote`, it first writes `preflight_probe/probe_report.md` and `preflight_probe/probe_report.json`, then only sends `ready` parsers into the final vote.
-- `customer-pack`: `manifest.json`, `README.md`, `metadata.json`, `vote_report.md/json`, `preflight_probe/probe_report.md/json`, `best.md/txt/json`, optional `customer_best.md/txt/json`, `tables/table_vote_report.md/json`, `tables/best_tables.md/csv/json`, `layout.json`, and `page_map.json`.
+- `vote`: `vote_report.md`, `vote_report.json`, and `best.md`/`best.txt`/`best.json` depending on `--format`. With `--customer`, also writes `customer_best.md`/`customer_best.txt`/`customer_best.json` and `customer_best.schema.json`; with `--profile invoice`, those customer files contain structured invoice fields, validation results, `field_confidence`, and `audit.field_fusion`. Field-level fusion is enabled by default and can be disabled with `--no-field-fusion`. With business profiles such as `contract`, `bank_statement`, `quotation`, `purchase_order`, `report`, and `annual_report`, customer files contain lightweight `fields` and `field_confidence`. With `--field-layout`, it also writes `field_layout.json` and fills field `bbox/location` when layout matching succeeds. With `--field-evidence`, it writes `field_evidence/*`; with `--review-html`, it writes `review.html`. With `--probe-before-vote`, it first writes `preflight_probe/probe_report.md` and `preflight_probe/probe_report.json`, then only sends `ready` parsers into the final vote.
+- `customer-pack`: `manifest.json`, `README.md`, `metadata.json`, `vote_report.md/json`, `preflight_probe/probe_report.md/json`, `best.md/txt/json`, `customer_best.md/txt/json`, `customer_best.schema.json`, `field_evidence/field_evidence.md/json`, field evidence PNGs, `review.html`, `tables/table_vote_report.md/json`, `tables/best_tables.md/csv/json`, `layout.json`, and `page_map.json`.
 - `batch-customer-pack`: per-file customer-pack directories plus top-level `index.json` and `index.md`.
 - `probe`: `probe_report.md`, `probe_report.json`, and per-parser sample text. It distinguishes `ready`, `dependency_missing`, `runtime_failed`, `quality_failed`, and `timeout`.
 - `table-vote`: `table_vote_report.md/json` and `best_tables.md/csv/json`.
+- `init-golden`: `cases/*.json`, `index.json`, and `README.md`; case files reference the original PDFs rather than copying them.
 - `eval-golden`: top-level `golden_report.md/json`, plus per-case vote outputs under the evaluation output directory.
 - `auto`: `auto_report.md`, `auto_report.json`, `metadata.json`, `best.md`, `best.txt`, `best.json`, chunk outputs, and `fields.json`/`fields.md` for invoices.
 - `scan-dir`: `scan_report.md`, `scan_report.json`, and `scan_report.csv`.

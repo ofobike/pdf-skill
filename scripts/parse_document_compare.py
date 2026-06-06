@@ -28,7 +28,7 @@
 """
 from __future__ import annotations
 
-__version__ = "4.11.0"
+__version__ = "4.13.0"
 
 import argparse
 import csv
@@ -69,6 +69,11 @@ RAG_SNIPPET_CHARS = 500
 PARSER_HEALTH_CACHE_TTL_SECONDS = 24 * 60 * 60
 PARSER_HEALTH_CACHE_STATUSES = {"failed", "skipped", "timeout"}
 CUSTOMER_BEST_SCHEMA_VERSION = "1.0"
+PARSER_RESULT_CACHE_SCHEMA_VERSION = "1.0"
+BUSINESS_STRUCTURED_PROFILES = {"contract", "bank_statement", "quotation", "purchase_order", "report", "annual_report"}
+CUSTOMER_TEXT_TYPES = {"customer_invoice_delivery", "customer_structured_delivery", "customer_best_text"}
+GOLDEN_REPORT_NAMES = {"golden_report.json", "vote_report.json", "probe_report.json", "manifest.json", "metadata.json", "index.json"}
+GOLDEN_DEFAULT_PARSERS = "pymupdf,pdfplumber,liteparse"
 
 # ---------------------------------------------------------------------------
 # 数据结构
@@ -92,6 +97,7 @@ class ParseResult:
     quality_score: float = 0.0
     quality_label: str = "unknown"
     preview: str = ""
+    cache_status: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +465,99 @@ def update_parser_health_cache(
         "timestamp": time.time(),
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+
+def default_parser_result_cache_dir(out_dir: Path) -> Path:
+    """Default content cache directory colocated with the current run outputs."""
+    return out_dir / ".parser_result_cache"
+
+
+def file_cache_fingerprint(file_path: Path) -> dict[str, object]:
+    """Build a cheap invalidation fingerprint for parser result caching."""
+    stat = file_path.stat()
+    return {
+        "path": str(file_path.resolve()),
+        "size_bytes": stat.st_size,
+        "modified_ns": getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)),
+    }
+
+
+def parser_result_cache_key(
+    file_path: Path,
+    fmt: str,
+    parser_name: str,
+    start_page: int,
+    max_pages: int | None,
+    output_format: str,
+) -> str:
+    """Build a stable key for same-file same-parser extraction output."""
+    payload = {
+        "schema": PARSER_RESULT_CACHE_SCHEMA_VERSION,
+        "version": __version__,
+        "file": file_cache_fingerprint(file_path),
+        "format": fmt,
+        "parser": parser_name,
+        "start_page": start_page,
+        "max_pages": max_pages,
+        "output_format": output_format,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def parser_result_cache_path(cache_dir: Path, key: str) -> Path:
+    """Return the JSON file path for a parser result cache key."""
+    return cache_dir / f"{key}.json"
+
+
+def load_parser_result_cache(cache_dir: Path | None, key: str) -> dict[str, object] | None:
+    """Load cached parser text if available and valid."""
+    if cache_dir is None:
+        return None
+    path = parser_result_cache_path(cache_dir, key)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("schema_version") != PARSER_RESULT_CACHE_SCHEMA_VERSION or data.get("key") != key:
+        return None
+    if not isinstance(data.get("normalized"), str):
+        return None
+    return data
+
+
+def write_parser_result_cache(
+    cache_dir: Path | None,
+    key: str,
+    parser_name: str,
+    result: ParseResult,
+    normalized: str,
+) -> None:
+    """Persist parser text cache without failing the main workflow."""
+    if cache_dir is None or result.status != "ok" or not normalized:
+        return
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": PARSER_RESULT_CACHE_SCHEMA_VERSION,
+            "key": key,
+            "version": __version__,
+            "parser": parser_name,
+            "status": result.status,
+            "quality_score": result.quality_score,
+            "quality_label": result.quality_label,
+            "chars": result.chars,
+            "non_space_chars": result.non_space_chars,
+            "normalized": normalized,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        parser_result_cache_path(cache_dir, key).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:
+        logger.debug("failed to write parser result cache %s: %r", cache_dir, exc)
 
 
 def extract_one_subprocess(
@@ -2308,6 +2407,185 @@ def invoice_vote_metrics(fields: dict[str, object]) -> dict[str, object]:
     }
 
 
+def first_nonempty(*values: object) -> object | None:
+    """Return the first non-empty value."""
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return None
+
+
+def amount_first(text: str) -> float | None:
+    """Extract the first currency-looking amount from text."""
+    value = regex_first(r"(?:金额|合计|总价|总金额|价税合计|合同价款|报价总计|订单总额)[:：]?[¥￥]?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)", text)
+    if value:
+        return decimal_from_text(value)
+    fallback = regex_first(r"[¥￥]\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)", text)
+    return decimal_from_text(fallback)
+
+
+def date_first(text: str) -> str | None:
+    """Extract the first common date string."""
+    return regex_first(r"([0-9]{4}年[0-9]{1,2}月[0-9]{1,2}日|[0-9]{4}[-/][0-9]{1,2}[-/][0-9]{1,2})", text)
+
+
+def keyword_lines(text: str, keywords: list[str], limit: int = 8) -> list[str]:
+    """Return concise source lines that contain business keywords."""
+    lines: list[str] = []
+    seen: set[str] = set()
+    for raw in text.splitlines():
+        line = normalize_text(raw)
+        if not line or line in seen:
+            continue
+        if any(keyword in line for keyword in keywords):
+            seen.add(line)
+            lines.append(line[:240])
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def business_vote_metrics(fields: dict[str, object]) -> dict[str, object]:
+    """Score lightweight business extraction completeness."""
+    ignored = {
+        "version",
+        "schema_version",
+        "profile",
+        "source_file",
+        "parser",
+        "quality_score",
+        "quality_label",
+        "raw_text_chars",
+        "validation",
+    }
+    present_keys: list[str] = []
+    for key, value in fields.items():
+        if key in ignored:
+            continue
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        if isinstance(value, list) and not value:
+            continue
+        present_keys.append(key)
+    keyword_like = sum(
+        1
+        for key in present_keys
+        if key.endswith("terms") or key.endswith("clauses") or key.startswith("key_") or key.endswith("keywords")
+    )
+    field_count = len(present_keys)
+    score = min(1.0, field_count / 8)
+    if keyword_like:
+        score = min(1.0, score + min(0.12, keyword_like * 0.03))
+    return {
+        "score": round(score, 4),
+        "status": "ok" if field_count >= 3 else "partial" if field_count else "empty",
+        "field_count": field_count,
+        "present_keys": present_keys,
+    }
+
+
+def extract_business_fields_from_text(
+    profile: str,
+    text: str,
+    source_file: Path | None = None,
+    parser_name: str = "unknown",
+    result: ParseResult | None = None,
+) -> dict[str, object]:
+    """Extract lightweight structured fields for non-invoice business profiles."""
+    normalized = normalize_text(text)
+    fields: dict[str, object] = {
+        "version": __version__,
+        "schema_version": CUSTOMER_BEST_SCHEMA_VERSION,
+        "profile": profile,
+        "source_file": str(source_file) if source_file else None,
+        "parser": parser_name,
+        "quality_score": result.quality_score if result else None,
+        "quality_label": result.quality_label if result else None,
+        "raw_text_chars": len(normalized),
+    }
+
+    if profile == "contract":
+        fields.update({
+            "contract_number": regex_first(r"(?:合同编号|协议编号|编号)[:：]?\s*([A-Za-z0-9\-_/（）()]{3,60})", normalized),
+            "party_a": regex_first(r"(?:甲方|委托方|买方)[:：]?\s*([^\n\r]{2,80})", normalized),
+            "party_b": regex_first(r"(?:乙方|受托方|卖方)[:：]?\s*([^\n\r]{2,80})", normalized),
+            "signing_date": first_nonempty(regex_first(r"(?:签订日期|签署日期|合同日期)[:：]?\s*([0-9]{4}年[0-9]{1,2}月[0-9]{1,2}日|[0-9]{4}[-/][0-9]{1,2}[-/][0-9]{1,2})", normalized), date_first(normalized)),
+            "amount": amount_first(normalized),
+            "term": regex_first(r"(?:履行期限|服务期限|合同期限|有效期)[:：]?\s*([^\n\r。；;]{2,120})", normalized),
+            "payment_terms": regex_first(r"(?:付款方式|付款条件|支付方式|结算方式)[:：]?\s*([^\n\r。；;]{2,160})", normalized),
+            "dispute_resolution": regex_first(r"(?:争议解决|管辖法院|仲裁)[:：]?\s*([^\n\r。；;]{2,160})", normalized),
+            "key_clauses": keyword_lines(normalized, ["甲方", "乙方", "合同金额", "付款", "违约", "争议解决", "履行期限"]),
+        })
+    elif profile == "bank_statement":
+        fields.update({
+            "account_name": regex_first(r"(?:账户名称|户名|客户名称)[:：]?\s*([^\n\r]{2,80})", normalized),
+            "account_number": regex_first(r"(?:账号|账户|卡号)[:：]?\s*([0-9\s*]{8,40})", normalized),
+            "bank_name": regex_first(r"(?:开户行|银行名称|银行)[:：]?\s*([^\n\r]{2,80})", normalized),
+            "statement_period": regex_first(r"(?:期间|起止日期|交易日期)[:：]?\s*([0-9年月日/\-\s至~]{8,60})", normalized),
+            "currency": regex_first(r"(?:币种|货币)[:：]?\s*([A-Z]{3}|人民币|美元|欧元|港币)", normalized),
+            "opening_balance": decimal_from_text(regex_first(r"(?:期初余额|上期余额)[:：]?[¥￥]?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)", normalized)),
+            "closing_balance": decimal_from_text(regex_first(r"(?:期末余额|余额)[:：]?[¥￥]?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)", normalized)),
+            "transaction_keywords": keyword_lines(normalized, ["交易日期", "借方", "贷方", "余额", "交易金额", "对方户名", "摘要"]),
+        })
+    elif profile == "quotation":
+        fields.update({
+            "quotation_number": regex_first(r"(?:报价单号|报价编号|编号)[:：]?\s*([A-Za-z0-9\-_/]{3,60})", normalized),
+            "quotation_date": first_nonempty(regex_first(r"(?:报价日期|日期)[:：]?\s*([0-9]{4}年[0-9]{1,2}月[0-9]{1,2}日|[0-9]{4}[-/][0-9]{1,2}[-/][0-9]{1,2})", normalized), date_first(normalized)),
+            "customer_name": regex_first(r"(?:客户名称|客户|需方|采购方)[:：]?\s*([^\n\r]{2,80})", normalized),
+            "supplier_name": regex_first(r"(?:供应商|报价方|供方|销售方)[:：]?\s*([^\n\r]{2,80})", normalized),
+            "total_amount": amount_first(normalized),
+            "valid_until": regex_first(r"(?:有效期|报价有效期|有效至)[:：]?\s*([^\n\r。；;]{2,80})", normalized),
+            "payment_terms": regex_first(r"(?:付款方式|付款条件|支付方式)[:：]?\s*([^\n\r。；;]{2,120})", normalized),
+            "contact": regex_first(r"(?:联系人|报价人)[:：]?\s*([^\s\n\r]{2,40})", normalized),
+            "price_terms": keyword_lines(normalized, ["报价", "单价", "金额", "含税", "税率", "有效期", "付款"]),
+        })
+    elif profile == "purchase_order":
+        fields.update({
+            "purchase_order_number": regex_first(r"(?:采购订单号|订单编号|采购单号|PO)[:：]?\s*([A-Za-z0-9\-_/]{3,60})", normalized),
+            "order_date": first_nonempty(regex_first(r"(?:订单日期|下单日期|日期)[:：]?\s*([0-9]{4}年[0-9]{1,2}月[0-9]{1,2}日|[0-9]{4}[-/][0-9]{1,2}[-/][0-9]{1,2})", normalized), date_first(normalized)),
+            "buyer_name": regex_first(r"(?:采购方|买方|需方)[:：]?\s*([^\n\r]{2,80})", normalized),
+            "supplier_name": regex_first(r"(?:供应商|卖方|供方)[:：]?\s*([^\n\r]{2,80})", normalized),
+            "delivery_date": regex_first(r"(?:交货日期|交付日期|到货日期)[:：]?\s*([0-9]{4}年[0-9]{1,2}月[0-9]{1,2}日|[0-9]{4}[-/][0-9]{1,2}[-/][0-9]{1,2}|[^\n\r。；;]{2,60})", normalized),
+            "total_amount": amount_first(normalized),
+            "payment_terms": regex_first(r"(?:付款方式|付款条件|支付方式|结算方式)[:：]?\s*([^\n\r。；;]{2,120})", normalized),
+            "order_terms": keyword_lines(normalized, ["采购", "供应商", "交货", "数量", "单价", "金额", "付款"]),
+        })
+    elif profile == "annual_report":
+        fields.update({
+            "company_name": regex_first(r"([^\n\r]{2,80}(?:股份有限公司|有限公司|集团有限公司))", normalized),
+            "report_year": regex_first(r"([12][0-9]{3})\s*(?:年|年度报告|年报)", normalized),
+            "report_date": date_first(normalized),
+            "total_assets": decimal_from_text(regex_first(r"(?:资产总计|总资产)[:：]?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)", normalized)),
+            "revenue": decimal_from_text(regex_first(r"(?:营业收入|主营业务收入)[:：]?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)", normalized)),
+            "net_profit": decimal_from_text(regex_first(r"(?:净利润|归属于.*?净利润)[:：]?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)", normalized)),
+            "auditor": regex_first(r"(?:会计师事务所|审计机构)[:：]?\s*([^\n\r]{2,80})", normalized),
+            "key_sections": keyword_lines(normalized, ["年度报告", "资产负债表", "利润表", "现金流量表", "董事会", "审计报告"]),
+        })
+    else:
+        fields.update({
+            "title": first_nonempty(regex_first(r"^#\s*(.+)$", normalized, re.M), regex_first(r"^([^\n\r]{4,80})$", normalized, re.M)),
+            "report_date": date_first(normalized),
+            "organization": regex_first(r"(?:编制单位|报告单位|公司|机构)[:：]?\s*([^\n\r]{2,80})", normalized),
+            "summary": regex_first(r"(?:摘要|概述)[:：]?\s*([^\n\r。]{10,220})", normalized),
+            "conclusion": regex_first(r"(?:结论|建议)[:：]?\s*([^\n\r。]{10,220})", normalized),
+            "amount": amount_first(normalized),
+            "key_findings": keyword_lines(normalized, ["摘要", "结论", "指标", "同比", "环比", "风险", "建议", "附录"]),
+        })
+
+    metrics = business_vote_metrics(fields)
+    fields["validation"] = {
+        "status": "ok" if metrics.get("field_count", 0) >= 3 else "partial",
+        "field_count": metrics.get("field_count", 0),
+        "present_keys": metrics.get("present_keys", []),
+    }
+    return fields
+
+
 def collect_parser_outputs(
     file_path: Path,
     fmt: str,
@@ -2321,12 +2599,16 @@ def collect_parser_outputs(
     timeout_seconds: float | None = None,
     health_cache_path: Path | None = None,
     use_health_cache: bool = False,
+    result_cache_dir: Path | None = None,
+    use_result_cache: bool = False,
 ) -> tuple[list[ParseResult], dict[str, str], Path]:
     """Run parser candidates and write their raw outputs."""
     out_dir.mkdir(parents=True, exist_ok=True)
     if use_health_cache and health_cache_path is None:
         health_cache_path = default_parser_health_cache_path(out_dir)
     health_cache = load_parser_health_cache(health_cache_path) if use_health_cache else {"version": __version__, "entries": {}}
+    if use_result_cache and result_cache_dir is None:
+        result_cache_dir = default_parser_result_cache_dir(out_dir)
     actual_path = file_path
     temp_dir_obj: tempfile.TemporaryDirectory[str] | None = None
     subset_skip_reason: str | None = None
@@ -2355,6 +2637,19 @@ def collect_parser_outputs(
         if extract_func is None:
             return ParseResult(parser=name, status="skipped", seconds=0, error=f"未注册的解析器：{name}"), ""
 
+        result_cache_key = parser_result_cache_key(file_path, fmt, name, start_page, max_pages, output_format)
+        if use_result_cache:
+            cached = load_parser_result_cache(result_cache_dir, result_cache_key)
+            if cached is not None:
+                start = time.perf_counter()
+                normalized = str(cached.get("normalized") or "")
+                out_file, normalized = write_extracted_outputs(out_dir, name, normalized, output_format)
+                result = text_stats(name, "ok", time.perf_counter() - start, normalized, out_file)
+                result.cache_status = "hit"
+                if use_health_cache:
+                    update_parser_health_cache(health_cache, cache_key, name, result, timeout_seconds)
+                return result, normalized
+
         target = actual_path if (name in PDF_SUBSET_TARGET_PARSERS and fmt == "pdf") else file_path
         start = time.perf_counter()
         try:
@@ -2373,6 +2668,9 @@ def collect_parser_outputs(
                 raw_text = extract_func(target, start_page, max_pages)
                 out_file, normalized = write_extracted_outputs(out_dir, name, raw_text, output_format)
                 result = text_stats(name, "ok", time.perf_counter() - start, normalized, out_file)
+            result.cache_status = "miss" if use_result_cache and result.status == "ok" else None
+            if use_result_cache:
+                write_parser_result_cache(result_cache_dir, result_cache_key, name, result, normalized)
             if use_health_cache:
                 update_parser_health_cache(health_cache, cache_key, name, result, timeout_seconds)
             return result, normalized
@@ -2458,15 +2756,18 @@ def build_vote_payload(
     profile_info = detect_vote_profile(profile, fmt, normalized_texts)
     resolved_profile = str(profile_info.get("resolved") or "none")
     invoice_enabled = resolved_profile == "invoice"
+    business_enabled = resolved_profile in BUSINESS_STRUCTURED_PROFILES
     weights = {
-        "quality_score": 0.34 if invoice_enabled else 0.42,
-        "consensus_score": 0.18 if invoice_enabled else 0.24,
-        "coverage_score": 0.10 if invoice_enabled else 0.16,
+        "quality_score": 0.34 if invoice_enabled else 0.36 if business_enabled else 0.42,
+        "consensus_score": 0.18 if invoice_enabled else 0.20 if business_enabled else 0.24,
+        "coverage_score": 0.10 if invoice_enabled else 0.12 if business_enabled else 0.16,
         "structure_score": 0.08 if invoice_enabled else 0.10,
-        "repetition_score": 0.07 if invoice_enabled else 0.08,
+        "repetition_score": 0.07 if invoice_enabled else 0.07 if business_enabled else 0.08,
     }
     if invoice_enabled:
         weights["invoice_score"] = 0.23
+    if business_enabled:
+        weights["business_score"] = 0.15
     votes: list[dict[str, object]] = []
 
     for result in results:
@@ -2499,6 +2800,9 @@ def build_vote_payload(
         invoice_fields: dict[str, object] | None = None
         invoice_metrics: dict[str, object] | None = None
         invoice_score = 0.0
+        structured_fields: dict[str, object] | None = None
+        business_metrics: dict[str, object] | None = None
+        business_score = 0.0
         if invoice_enabled:
             try:
                 invoice_fields = extract_invoice_fields_from_text(text, file_path, result.parser, result, strict=True)
@@ -2508,6 +2812,17 @@ def build_vote_payload(
                 invoice_metrics = {
                     "score": 0.0,
                     "validation_status": "failed_extraction",
+                    "error": repr(exc),
+                }
+        if business_enabled:
+            try:
+                structured_fields = extract_business_fields_from_text(resolved_profile, text, file_path, result.parser, result)
+                business_metrics = business_vote_metrics(structured_fields)
+                business_score = float(business_metrics.get("score") or 0.0)
+            except Exception as exc:
+                business_metrics = {
+                    "score": 0.0,
+                    "status": "failed_extraction",
                     "error": repr(exc),
                 }
         penalty = 0.0
@@ -2530,6 +2845,8 @@ def build_vote_payload(
         )
         if invoice_enabled:
             raw_score += invoice_score * weights["invoice_score"]
+        if business_enabled:
+            raw_score += business_score * weights["business_score"]
         vote_score = round(
             max(
                 0.0,
@@ -2559,12 +2876,18 @@ def build_vote_payload(
             "non_space_chars": result.non_space_chars,
             "seconds": result.seconds,
             "output_file": result.output_file,
+            "cache_status": result.cache_status,
         }
         if invoice_enabled:
             vote_item["invoice_score"] = round(invoice_score, 4)
             vote_item["invoice_metrics"] = invoice_metrics
             if invoice_fields is not None:
                 vote_item["invoice_fields"] = invoice_fields
+        if business_enabled:
+            vote_item["business_score"] = round(business_score, 4)
+            vote_item["business_metrics"] = business_metrics
+            if structured_fields is not None:
+                vote_item["structured_fields"] = structured_fields
         votes.append(vote_item)
 
     eligible_votes = [vote for vote in votes if vote.get("eligible")]
@@ -2572,6 +2895,7 @@ def build_vote_payload(
         key=lambda vote: (
             float(vote.get("vote_score", 0.0)),
             float(vote.get("invoice_score", 0.0)),
+            float(vote.get("business_score", 0.0)),
             float(vote.get("repetition_score", 0.0)),
             float(vote.get("quality_score", 0.0)),
             int(vote.get("non_space_chars", 0)),
@@ -2588,6 +2912,8 @@ def build_vote_payload(
         diagnostics.append("No parser produced a customer-deliverable output.")
     if invoice_enabled:
         diagnostics.append("Invoice profile is enabled: structured field completeness, validation status, and duplicate line-item checks are included in the vote.")
+    if business_enabled:
+        diagnostics.append(f"{resolved_profile} profile is enabled: business field coverage and keyword extraction are included in the vote.")
     if any(float(vote.get("duplicate_penalty") or 0.0) > 0 for vote in votes if isinstance(vote, dict)):
         diagnostics.append("One or more parser outputs were penalized for repeated lines or repeated text spans.")
     if preflight_probe:
@@ -2675,8 +3001,8 @@ def vote_to_markdown(payload: dict[str, object]) -> str:
     lines.extend([
         "## Votes",
         "",
-        "| Parser | Eligible | Vote | Quality | Consensus | Coverage | Structure | Repetition | Invoice | Penalty | Chars | Time(s) |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Parser | Eligible | Vote | Quality | Consensus | Coverage | Structure | Repetition | Invoice | Business | Penalty | Chars | Time(s) | Cache |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ])
     votes = payload.get("votes") if isinstance(payload.get("votes"), list) else []
     for item in votes:
@@ -2687,7 +3013,8 @@ def vote_to_markdown(payload: dict[str, object]) -> str:
             f"{item.get('quality_score', '')} | {item.get('consensus_score', '')} | "
             f"{item.get('coverage_score', '')} | {item.get('structure_score', '')} | "
             f"{item.get('repetition_score', '')} | {item.get('invoice_score', '')} | "
-            f"{item.get('penalty', '')} | {item.get('chars', '')} | {item.get('seconds', '')} |"
+            f"{item.get('business_score', '')} | {item.get('penalty', '')} | {item.get('chars', '')} | "
+            f"{item.get('seconds', '')} | {item.get('cache_status', '')} |"
         )
 
     diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), list) else []
@@ -2725,6 +3052,7 @@ def write_vote_outputs(
         elif suffix == "json":
             payload_json = {
                 "version": __version__,
+                "schema_version": CUSTOMER_BEST_SCHEMA_VERSION,
                 "type": "customer_best_text",
                 "parser": winner_parser,
                 "source_file": payload.get("source_file"),
@@ -2961,6 +3289,8 @@ def build_field_confidence(
     payload: dict[str, object],
     normalized_texts: dict[str, str],
     layout: dict[str, object] | None = None,
+    final_fields: dict[str, object] | None = None,
+    final_field_decisions: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Build field-level confidence from invoice vote candidates."""
     winner = payload.get("winner") if isinstance(payload.get("winner"), dict) else {}
@@ -2978,7 +3308,9 @@ def build_field_confidence(
     candidates = layout_field_candidates(layout)
     confidence: dict[str, object] = {}
     for field in INVOICE_CONFIDENCE_FIELDS:
-        winning_value = winner_fields.get(field)
+        decision = final_field_decisions.get(field) if isinstance(final_field_decisions, dict) and isinstance(final_field_decisions.get(field), dict) else {}
+        winning_value = final_fields.get(field) if isinstance(final_fields, dict) and field in final_fields else winner_fields.get(field)
+        source_parser = str(decision.get("source_parser") or winner_parser or "")
         normalized_winning = normalize_field_value(winning_value)
         winner_location = find_field_in_layout(layout, winning_value, field, candidates)
         sources: list[dict[str, object]] = []
@@ -2996,6 +3328,7 @@ def build_field_confidence(
             sources.append({
                 "parser": parser_name,
                 "value": value,
+                "matches_final": bool(same),
                 "matches_winner": bool(same),
                 "page": source_location.get("page") if source_location else estimate_field_page(text, value),
                 "bbox": source_location.get("bbox") if source_location else None,
@@ -3003,15 +3336,20 @@ def build_field_confidence(
                 "confidence": round(1.0 if same else 0.55, 4),
             })
         base_confidence = support / parser_count if normalized_winning else 0.0
-        if normalized_winning and winner_parser in parser_fields:
+        if normalized_winning and source_parser in parser_fields:
             base_confidence = min(1.0, base_confidence + 0.12)
+        if decision.get("confidence") is not None:
+            try:
+                base_confidence = max(base_confidence, float(decision.get("confidence") or 0.0))
+            except (TypeError, ValueError):
+                pass
         confidence[field] = {
             "value": winning_value,
-            "source_parser": winner_parser if normalized_winning else None,
+            "source_parser": source_parser if normalized_winning else None,
             "support_count": support,
             "parser_count": parser_count,
             "confidence": round(base_confidence, 4),
-            "page": winner_location.get("page") if winner_location else estimate_field_page(normalized_texts.get(winner_parser, ""), winning_value),
+            "page": winner_location.get("page") if winner_location else estimate_field_page(normalized_texts.get(source_parser, ""), winning_value),
             "bbox": winner_location.get("bbox") if winner_location else None,
             "location": winner_location,
             "sources": sources,
@@ -3321,8 +3659,10 @@ def build_customer_invoice_delivery(
         parser_name = "field-fusion"
     else:
         parser_name = winner.get("parser")
+    fusion_decisions = fusion.get("field_decisions") if isinstance(fusion, dict) and isinstance(fusion.get("field_decisions"), dict) else None
     return {
         "version": __version__,
+        "schema_version": CUSTOMER_BEST_SCHEMA_VERSION,
         "type": "customer_invoice_delivery",
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "source_file": payload.get("source_file"),
@@ -3332,7 +3672,7 @@ def build_customer_invoice_delivery(
         "invoice_score": winner.get("invoice_score"),
         "quality_score": winner.get("quality_score"),
         "validation": fields.get("validation"),
-        "field_confidence": build_field_confidence(payload, normalized_texts, layout),
+        "field_confidence": build_field_confidence(payload, normalized_texts, layout, fields, fusion_decisions),
         "invoice": {
             "invoice_type": fields.get("invoice_type"),
             "invoice_number": fields.get("invoice_number"),
@@ -3368,6 +3708,190 @@ def build_customer_invoice_delivery(
             },
         },
     }
+
+
+def build_structured_field_confidence(
+    payload: dict[str, object],
+    normalized_texts: dict[str, str],
+    layout: dict[str, object] | None,
+    fields: dict[str, object],
+) -> dict[str, object]:
+    """Build field confidence for lightweight business structured fields."""
+    winner = payload.get("winner") if isinstance(payload.get("winner"), dict) else {}
+    winner_parser = str(winner.get("parser") or "")
+    votes = payload.get("votes") if isinstance(payload.get("votes"), list) else []
+    parser_fields: dict[str, dict[str, object]] = {}
+    for vote in votes:
+        if not isinstance(vote, dict) or not vote.get("eligible"):
+            continue
+        row_fields = vote.get("structured_fields") if isinstance(vote.get("structured_fields"), dict) else None
+        if row_fields:
+            parser_fields[str(vote.get("parser"))] = row_fields
+    parser_count = max(1, len(parser_fields))
+    candidates = layout_field_candidates(layout)
+    ignored = {"version", "schema_version", "profile", "source_file", "parser", "quality_score", "quality_label", "raw_text_chars", "validation"}
+    confidence: dict[str, object] = {}
+    for field, value in fields.items():
+        if field in ignored:
+            continue
+        if isinstance(value, (dict, list)):
+            if not value:
+                continue
+            value_for_match = value[0] if isinstance(value, list) and value else None
+        else:
+            value_for_match = value
+        normalized_value = normalize_field_value(value_for_match)
+        if not normalized_value:
+            continue
+        support = 0
+        sources: list[dict[str, object]] = []
+        for parser_name, parser_data in parser_fields.items():
+            candidate_value = parser_data.get(field)
+            if isinstance(candidate_value, list):
+                candidate_match_value = candidate_value[0] if candidate_value else None
+            else:
+                candidate_match_value = candidate_value
+            same = normalize_field_value(candidate_match_value) == normalized_value
+            if same:
+                support += 1
+            location = find_field_in_layout(layout, candidate_match_value, field, candidates)
+            sources.append({
+                "parser": parser_name,
+                "value": candidate_value,
+                "matches_final": bool(same),
+                "page": location.get("page") if location else estimate_field_page(normalized_texts.get(parser_name, ""), candidate_match_value),
+                "bbox": location.get("bbox") if location else None,
+                "location": location,
+            })
+        location = find_field_in_layout(layout, value_for_match, field, candidates)
+        confidence[field] = {
+            "value": value,
+            "source_parser": winner_parser,
+            "support_count": support,
+            "parser_count": parser_count,
+            "confidence": round(min(1.0, support / parser_count + 0.12), 4),
+            "page": location.get("page") if location else estimate_field_page(normalized_texts.get(winner_parser, ""), value_for_match),
+            "bbox": location.get("bbox") if location else None,
+            "location": location,
+            "sources": sources,
+        }
+    return confidence
+
+
+def build_customer_structured_delivery(
+    payload: dict[str, object],
+    normalized_texts: dict[str, str],
+    layout: dict[str, object] | None = None,
+) -> dict[str, object] | None:
+    """Build customer delivery for lightweight non-invoice business profiles."""
+    profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else {}
+    resolved = str(profile.get("resolved") or "")
+    if resolved not in BUSINESS_STRUCTURED_PROFILES:
+        return None
+    winner = payload.get("winner") if isinstance(payload.get("winner"), dict) else None
+    if not winner:
+        return None
+    fields = winner.get("structured_fields") if isinstance(winner.get("structured_fields"), dict) else None
+    if not fields:
+        return None
+    return {
+        "version": __version__,
+        "schema_version": CUSTOMER_BEST_SCHEMA_VERSION,
+        "type": "customer_structured_delivery",
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "source_file": payload.get("source_file"),
+        "profile": resolved,
+        "parser": winner.get("parser"),
+        "vote_score": winner.get("vote_score"),
+        "business_score": winner.get("business_score"),
+        "quality_score": winner.get("quality_score"),
+        "validation": fields.get("validation"),
+        "fields": {
+            key: value
+            for key, value in fields.items()
+            if key not in {"version", "schema_version", "profile", "source_file", "parser", "quality_score", "quality_label", "raw_text_chars", "validation"}
+        },
+        "field_confidence": build_structured_field_confidence(payload, normalized_texts, layout, fields),
+        "audit": {
+            "profile": profile,
+            "weights": payload.get("weights"),
+            "winner": {
+                key: winner.get(key)
+                for key in [
+                    "parser",
+                    "vote_score",
+                    "quality_score",
+                    "consensus_score",
+                    "coverage_score",
+                    "structure_score",
+                    "repetition_score",
+                    "business_score",
+                    "penalty",
+                ]
+            },
+        },
+    }
+
+
+def customer_structured_to_markdown(delivery: dict[str, object]) -> str:
+    """Render lightweight business structured delivery as Markdown."""
+    fields = delivery.get("fields") if isinstance(delivery.get("fields"), dict) else {}
+    validation = delivery.get("validation") if isinstance(delivery.get("validation"), dict) else {}
+    lines = [
+        f"# {delivery.get('profile')} 结构化解析结果",
+        "",
+        f"- 来源文件：`{delivery.get('source_file')}`",
+        f"- 推荐解析器：`{delivery.get('parser')}`",
+        f"- 投票得分：`{delivery.get('vote_score')}`",
+        f"- 业务字段得分：`{delivery.get('business_score')}`",
+        f"- 字段状态：`{validation.get('status')}`",
+        "",
+        "## 字段",
+        "",
+        "| 字段 | 值 |",
+        "|---|---|",
+    ]
+    for key, value in fields.items():
+        if isinstance(value, list):
+            rendered = "<br>".join(customer_value(item) for item in value)
+        else:
+            rendered = customer_value(value)
+        lines.append(f"| `{key}` | {rendered} |")
+    confidence = delivery.get("field_confidence") if isinstance(delivery.get("field_confidence"), dict) else {}
+    if confidence:
+        lines.extend(["", "## 字段置信度", "", "| 字段 | 来源解析器 | 置信度 | 支持数 | 页码 | 坐标 |", "|---|---|---:|---:|---:|---|"])
+        for key, info in confidence.items():
+            if not isinstance(info, dict):
+                continue
+            lines.append(
+                f"| `{key}` | {customer_value(info.get('source_parser'))} | {customer_value(info.get('confidence'))} | "
+                f"{customer_value(info.get('support_count'))}/{customer_value(info.get('parser_count'))} | "
+                f"{customer_value(info.get('page'))} | {customer_bbox(info.get('bbox'))} |"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def customer_structured_to_txt(delivery: dict[str, object]) -> str:
+    """Render lightweight business structured delivery as plain text."""
+    fields = delivery.get("fields") if isinstance(delivery.get("fields"), dict) else {}
+    validation = delivery.get("validation") if isinstance(delivery.get("validation"), dict) else {}
+    lines = [
+        f"{delivery.get('profile')} 结构化解析结果",
+        f"来源文件: {delivery.get('source_file')}",
+        f"推荐解析器: {delivery.get('parser')}",
+        f"投票得分: {delivery.get('vote_score')}",
+        f"业务字段得分: {delivery.get('business_score')}",
+        f"字段状态: {validation.get('status')}",
+        "",
+        "字段",
+    ]
+    for key, value in fields.items():
+        if isinstance(value, list):
+            rendered = "; ".join(customer_value(item) for item in value)
+        else:
+            rendered = customer_value(value)
+        lines.append(f"{key}: {rendered}")
+    return "\n".join(lines) + "\n"
 
 
 def customer_invoice_to_markdown(delivery: dict[str, object]) -> str:
@@ -3546,6 +4070,7 @@ def build_customer_text_delivery(
         return None
     return {
         "version": __version__,
+        "schema_version": CUSTOMER_BEST_SCHEMA_VERSION,
         "type": "customer_best_text",
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "source_file": payload.get("source_file"),
@@ -3554,6 +4079,83 @@ def build_customer_text_delivery(
         "quality_score": winner.get("quality_score"),
         "text": text,
     }
+
+
+def build_customer_delivery(
+    payload: dict[str, object],
+    normalized_texts: dict[str, str],
+    layout: dict[str, object] | None = None,
+    field_fusion: bool = True,
+) -> dict[str, object] | None:
+    """Build the best customer delivery payload for the resolved profile."""
+    profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else {}
+    delivery: dict[str, object] | None = None
+    if profile.get("resolved") == "invoice":
+        delivery = build_customer_invoice_delivery(payload, normalized_texts, layout, field_fusion)
+    if delivery is None and profile.get("resolved") in BUSINESS_STRUCTURED_PROFILES:
+        delivery = build_customer_structured_delivery(payload, normalized_texts, layout)
+    if delivery is None:
+        delivery = build_customer_text_delivery(payload, normalized_texts)
+    return delivery
+
+
+def customer_best_json_schema() -> dict[str, object]:
+    """Return the customer_best.json delivery contract."""
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "customer_best.schema.json",
+        "title": "PDF Skill Customer Best Delivery",
+        "type": "object",
+        "required": ["version", "schema_version", "type", "generated_at", "source_file", "parser"],
+        "properties": {
+            "version": {"type": "string"},
+            "schema_version": {"const": CUSTOMER_BEST_SCHEMA_VERSION},
+            "type": {"enum": sorted(CUSTOMER_TEXT_TYPES)},
+            "generated_at": {"type": "string"},
+            "source_file": {"type": ["string", "null"]},
+            "parser": {"type": ["string", "null"]},
+            "base_parser": {"type": ["string", "null"]},
+            "profile": {"type": ["string", "null"]},
+            "vote_score": {"type": ["number", "null"]},
+            "quality_score": {"type": ["number", "null"]},
+            "invoice_score": {"type": ["number", "null"]},
+            "business_score": {"type": ["number", "null"]},
+            "validation": {"type": ["object", "null"]},
+            "invoice": {"type": "object"},
+            "fields": {"type": "object"},
+            "field_confidence": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",
+                    "properties": {
+                        "value": {},
+                        "source_parser": {"type": ["string", "null"]},
+                        "support_count": {"type": "integer"},
+                        "parser_count": {"type": "integer"},
+                        "confidence": {"type": "number"},
+                        "page": {"type": ["integer", "null"]},
+                        "bbox": {
+                            "anyOf": [
+                                {"type": "null"},
+                                {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4},
+                            ]
+                        },
+                        "location": {"type": ["object", "null"]},
+                        "evidence_image": {"type": ["string", "null"]},
+                        "sources": {"type": "array"},
+                    },
+                },
+            },
+            "audit": {"type": "object"},
+            "text": {"type": "string"},
+        },
+        "additionalProperties": True,
+    }
+
+
+def write_customer_schema(out_dir: Path) -> Path:
+    """Write the stable customer_best.json schema contract."""
+    return write_json_file(out_dir / "customer_best.schema.json", customer_best_json_schema())
 
 
 def write_customer_outputs(
@@ -3565,17 +4167,21 @@ def write_customer_outputs(
     field_fusion: bool = True,
 ) -> list[Path]:
     """Write customer_best.* outputs from structured fields when available."""
-    profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else {}
-    delivery: dict[str, object] | None = None
-    if profile.get("resolved") == "invoice":
-        delivery = build_customer_invoice_delivery(payload, normalized_texts, layout, field_fusion)
-    if delivery is None:
-        delivery = build_customer_text_delivery(payload, normalized_texts)
+    delivery = build_customer_delivery(payload, normalized_texts, layout, field_fusion)
     if delivery is None:
         return []
+    return write_customer_delivery_outputs(delivery, out_dir, output_format)
 
+
+def write_customer_delivery_outputs(
+    delivery: dict[str, object],
+    out_dir: Path,
+    output_format: str,
+) -> list[Path]:
+    """Write an already-built customer delivery payload."""
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
+    written.append(write_customer_schema(out_dir))
     for suffix in output_suffixes(output_format):
         path = out_dir / f"customer_best.{suffix}"
         if suffix == "json":
@@ -3583,15 +4189,335 @@ def write_customer_outputs(
         elif suffix == "md":
             if delivery.get("type") == "customer_invoice_delivery":
                 path.write_text(customer_invoice_to_markdown(delivery), encoding="utf-8")
+            elif delivery.get("type") == "customer_structured_delivery":
+                path.write_text(customer_structured_to_markdown(delivery), encoding="utf-8")
             else:
                 path.write_text(str(delivery.get("text") or "") + "\n", encoding="utf-8")
         elif suffix == "txt":
             if delivery.get("type") == "customer_invoice_delivery":
                 path.write_text(customer_invoice_to_txt(delivery), encoding="utf-8")
+            elif delivery.get("type") == "customer_structured_delivery":
+                path.write_text(customer_structured_to_txt(delivery), encoding="utf-8")
             else:
                 path.write_text(str(delivery.get("text") or "") + "\n", encoding="utf-8")
         written.append(path)
     return written
+
+
+def safe_filename_part(value: object, fallback: str = "item") -> str:
+    """Return a filesystem-friendly short name part."""
+    text = str(value or fallback)
+    text = re.sub(r"[^A-Za-z0-9._\-\u4e00-\u9fff]+", "_", text).strip("._")
+    return text[:80] or fallback
+
+
+def iter_customer_field_confidence(delivery: dict[str, object]) -> list[tuple[str, dict[str, object]]]:
+    """Return field confidence rows from a customer delivery."""
+    confidence = delivery.get("field_confidence") if isinstance(delivery.get("field_confidence"), dict) else {}
+    rows: list[tuple[str, dict[str, object]]] = []
+    for field, info in confidence.items():
+        if isinstance(info, dict):
+            rows.append((str(field), info))
+    return rows
+
+
+def crop_pdf_bbox_image(
+    pdf_path: Path,
+    page_number: int,
+    bbox: list[float],
+    out_path: Path,
+    dpi: int = 220,
+    padding_points: float = 6.0,
+) -> dict[str, object]:
+    """Crop one PDF bbox to an evidence PNG."""
+    if not module_exists("fitz"):
+        raise ImportError("字段截图需要 PyMuPDF/fitz，运行: pip install pymupdf")
+    import fitz  # type: ignore
+
+    doc = fitz.open(pdf_path)
+    try:
+        page_index = max(0, min(doc.page_count - 1, page_number - 1))
+        page = doc.load_page(page_index)
+        rect = fitz.Rect(*bbox)
+        rect.x0 -= padding_points
+        rect.y0 -= padding_points
+        rect.x1 += padding_points
+        rect.y1 += padding_points
+        rect = rect & page.rect
+        zoom = dpi / 72.0
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=rect, alpha=False)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        pix.save(out_path)
+        return {
+            "page": page_number,
+            "bbox": [round(float(item), 3) for item in bbox[:4]],
+            "file": str(out_path),
+            "width": pix.width,
+            "height": pix.height,
+            "dpi": dpi,
+            "padding_points": padding_points,
+        }
+    finally:
+        doc.close()
+
+
+def write_field_evidence_pack(
+    pdf_path: Path,
+    delivery: dict[str, object],
+    out_dir: Path,
+    dpi: int = 220,
+) -> dict[str, object]:
+    """Create field evidence crops from field_confidence bbox values."""
+    evidence_dir = out_dir / "field_evidence"
+    rows: list[dict[str, object]] = []
+    diagnostics: list[str] = []
+    for field, info in iter_customer_field_confidence(delivery):
+        page = info.get("page")
+        bbox = coerce_bbox(info.get("bbox"))
+        if not page or not bbox:
+            rows.append({
+                "field": field,
+                "value": info.get("value"),
+                "source_parser": info.get("source_parser"),
+                "page": page,
+                "bbox": bbox,
+                "status": "missing_bbox",
+                "file": None,
+            })
+            continue
+        try:
+            path = evidence_dir / f"{safe_filename_part(field)}_p{int(page):03d}.png"
+            crop = crop_pdf_bbox_image(pdf_path, int(page), bbox, path, dpi=dpi)
+            info["evidence_image"] = str(path)
+            rows.append({
+                "field": field,
+                "value": info.get("value"),
+                "source_parser": info.get("source_parser"),
+                "confidence": info.get("confidence"),
+                "status": "ok",
+                **crop,
+            })
+        except Exception as exc:
+            diagnostics.append(f"{field}: {exc!r}")
+            rows.append({
+                "field": field,
+                "value": info.get("value"),
+                "source_parser": info.get("source_parser"),
+                "page": page,
+                "bbox": bbox,
+                "status": "failed",
+                "file": None,
+                "error": repr(exc),
+            })
+    payload = {
+        "version": __version__,
+        "type": "field-evidence",
+        "source_file": str(pdf_path),
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "dpi": dpi,
+        "evidence_dir": str(evidence_dir),
+        "field_count": len(rows),
+        "image_count": sum(1 for row in rows if row.get("status") == "ok"),
+        "diagnostics": diagnostics,
+        "fields": rows,
+    }
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    md_lines = [
+        "# Field Evidence",
+        "",
+        f"- Source: `{pdf_path}`",
+        f"- Image count: `{payload['image_count']}` / `{payload['field_count']}`",
+        "",
+        "| Field | Value | Parser | Confidence | Page | BBox | Image | Status |",
+        "|---|---|---|---:|---:|---|---|---|",
+    ]
+    for row in rows:
+        image = Path(str(row.get("file"))).name if row.get("file") else ""
+        md_lines.append(
+            f"| `{row.get('field')}` | {customer_value(row.get('value'))} | {customer_value(row.get('source_parser'))} | "
+            f"{customer_value(row.get('confidence'))} | {customer_value(row.get('page'))} | {customer_bbox(row.get('bbox'))} | "
+            f"{image} | {row.get('status')} |"
+        )
+    md_path = evidence_dir / "field_evidence.md"
+    md_path.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
+    json_path = evidence_dir / "field_evidence.json"
+    payload["outputs"] = {"json": str(json_path), "md": str(md_path)}
+    write_json_file(json_path, payload)
+    return payload
+
+
+def html_rel_path(target: object, base_dir: Path) -> str:
+    """Return a safe relative path for local HTML links."""
+    if not target:
+        return ""
+    try:
+        return Path(str(target)).resolve().relative_to(base_dir.resolve()).as_posix()
+    except Exception:
+        try:
+            return Path(str(target)).resolve().as_uri()
+        except Exception:
+            return html.escape(str(target))
+
+
+def render_review_pages(pdf_path: Path, out_dir: Path, pages: list[int], dpi: int = 120) -> list[dict[str, object]]:
+    """Render PDF pages used by the review HTML."""
+    page_count = get_pdf_page_count(pdf_path)
+    page_indices = sorted({page - 1 for page in pages if isinstance(page, int) and 1 <= page <= page_count})
+    if not page_indices:
+        page_indices = [0] if page_count else []
+    rendered = render_pdf_pages(pdf_path, page_indices, out_dir / "review_pages", dpi=dpi)
+    zoom = dpi / 72.0
+    for item in rendered:
+        try:
+            item["point_width"] = round(float(item.get("width") or 0) / zoom, 3)
+            item["point_height"] = round(float(item.get("height") or 0) / zoom, 3)
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    return rendered
+
+
+def write_review_html(
+    pdf_path: Path,
+    delivery: dict[str, object],
+    out_dir: Path,
+    table_payload: dict[str, object] | None = None,
+    dpi: int = 120,
+) -> Path:
+    """Write a local HTML review page with page images and field bbox overlays."""
+    field_rows = iter_customer_field_confidence(delivery)
+    pages = [int(info.get("page")) for _, info in field_rows if info.get("page")]
+    rendered_pages = render_review_pages(pdf_path, out_dir, pages, dpi=dpi)
+    page_assets = {int(item.get("page") or 0): item for item in rendered_pages}
+    fields_for_js: list[dict[str, object]] = []
+    for field, info in field_rows:
+        bbox = coerce_bbox(info.get("bbox"))
+        page_no = int(info.get("page") or 0) if info.get("page") else None
+        page_asset = page_assets.get(page_no or 0)
+        fields_for_js.append({
+            "field": field,
+            "value": info.get("value"),
+            "source_parser": info.get("source_parser"),
+            "confidence": info.get("confidence"),
+            "page": page_no,
+            "bbox": bbox,
+            "image": html_rel_path(page_asset.get("file"), out_dir) if isinstance(page_asset, dict) else "",
+            "page_width": page_asset.get("point_width") if isinstance(page_asset, dict) else None,
+            "page_height": page_asset.get("point_height") if isinstance(page_asset, dict) else None,
+            "evidence_image": html_rel_path(info.get("evidence_image"), out_dir),
+        })
+    best_tables = table_payload.get("best_tables") if isinstance(table_payload, dict) and isinstance(table_payload.get("best_tables"), list) else []
+    data_json = json.dumps({
+        "source_file": str(pdf_path),
+        "delivery_type": delivery.get("type"),
+        "profile": delivery.get("profile") or (delivery.get("audit", {}) if isinstance(delivery.get("audit"), dict) else {}).get("profile"),
+        "fields": fields_for_js,
+        "tables": best_tables[:20],
+    }, ensure_ascii=False)
+    safe_data_json = data_json.replace("</", "<\\/")
+    html_text = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PDF Review</title>
+  <style>
+    :root {{ color-scheme: light; --line:#d7dee8; --ink:#16202a; --muted:#667085; --accent:#0f766e; --soft:#eaf7f5; }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; font-family: Arial, "Microsoft YaHei", sans-serif; color: var(--ink); background: #f6f8fb; }}
+    header {{ padding: 14px 18px; border-bottom: 1px solid var(--line); background: #fff; position: sticky; top: 0; z-index: 10; }}
+    header h1 {{ margin: 0; font-size: 18px; }}
+    .shell {{ display: grid; grid-template-columns: minmax(360px, 54vw) 1fr; min-height: calc(100vh - 52px); }}
+    .pdf {{ padding: 16px; overflow: auto; border-right: 1px solid var(--line); }}
+    .panel {{ padding: 16px; overflow: auto; background: #fff; }}
+    .page-wrap {{ position: relative; display: inline-block; background: #fff; box-shadow: 0 2px 10px rgba(22,32,42,.12); }}
+    .page-wrap img {{ display: block; max-width: 100%; height: auto; }}
+    .box {{ position: absolute; border: 3px solid var(--accent); background: rgba(15,118,110,.12); pointer-events: none; }}
+    .field {{ width: 100%; text-align: left; padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; background: #fff; margin-bottom: 8px; cursor: pointer; }}
+    .field.active {{ border-color: var(--accent); background: var(--soft); }}
+    .field strong {{ display: block; font-size: 13px; }}
+    .field span {{ display: block; color: var(--muted); font-size: 12px; margin-top: 4px; word-break: break-all; }}
+    table {{ border-collapse: collapse; width: 100%; font-size: 12px; margin: 10px 0 18px; }}
+    th, td {{ border: 1px solid var(--line); padding: 6px; vertical-align: top; }}
+    h2 {{ font-size: 15px; margin: 18px 0 10px; }}
+    @media (max-width: 900px) {{ .shell {{ grid-template-columns: 1fr; }} .pdf {{ border-right: 0; border-bottom: 1px solid var(--line); }} }}
+  </style>
+</head>
+<body>
+  <header><h1>PDF Review</h1></header>
+  <main class="shell">
+    <section class="pdf"><div id="page" class="page-wrap"></div></section>
+    <section class="panel">
+      <h2>Fields</h2>
+      <div id="fields"></div>
+      <h2>Tables</h2>
+      <div id="tables"></div>
+    </section>
+  </main>
+  <script id="review-data" type="application/json">{safe_data_json}</script>
+  <script>
+    const data = JSON.parse(document.getElementById('review-data').textContent);
+    const pageEl = document.getElementById('page');
+    const fieldsEl = document.getElementById('fields');
+    const tablesEl = document.getElementById('tables');
+    function showField(index) {{
+      const row = data.fields[index];
+      document.querySelectorAll('.field').forEach((el, i) => el.classList.toggle('active', i === index));
+      pageEl.innerHTML = '';
+      if (!row || !row.image) {{
+        pageEl.textContent = 'No page image for this field.';
+        return;
+      }}
+      const img = document.createElement('img');
+      img.src = row.image;
+      pageEl.appendChild(img);
+      if (row.bbox && row.page_width && row.page_height) {{
+        img.addEventListener('load', () => {{
+          const scaleX = img.clientWidth / row.page_width;
+          const scaleY = img.clientHeight / row.page_height;
+          const box = document.createElement('div');
+          box.className = 'box';
+          box.style.left = (row.bbox[0] * scaleX) + 'px';
+          box.style.top = (row.bbox[1] * scaleY) + 'px';
+          box.style.width = Math.max(8, (row.bbox[2] - row.bbox[0]) * scaleX) + 'px';
+          box.style.height = Math.max(8, (row.bbox[3] - row.bbox[1]) * scaleY) + 'px';
+          pageEl.appendChild(box);
+        }});
+      }}
+    }}
+    data.fields.forEach((row, index) => {{
+      const btn = document.createElement('button');
+      btn.className = 'field';
+      btn.innerHTML = `<strong>${{row.field}}</strong><span>${{row.value ?? ''}}</span><span>parser: ${{row.source_parser ?? ''}} | confidence: ${{row.confidence ?? ''}} | page: ${{row.page ?? ''}}</span>`;
+      btn.addEventListener('click', () => showField(index));
+      fieldsEl.appendChild(btn);
+    }});
+    if (data.tables.length) {{
+      data.tables.forEach((table) => {{
+        const title = document.createElement('div');
+        title.textContent = `Page ${{table.page}} Table ${{table.table_index}}`;
+        tablesEl.appendChild(title);
+        const tbl = document.createElement('table');
+        const head = document.createElement('tr');
+        (table.headers || []).forEach(h => {{ const th = document.createElement('th'); th.textContent = h; head.appendChild(th); }});
+        tbl.appendChild(head);
+        (table.rows || []).slice(0, 30).forEach(r => {{
+          const tr = document.createElement('tr');
+          r.forEach(c => {{ const td = document.createElement('td'); td.textContent = c; tr.appendChild(td); }});
+          tbl.appendChild(tr);
+        }});
+        tablesEl.appendChild(tbl);
+      }});
+    }} else {{
+      tablesEl.textContent = 'No voted tables in this pack.';
+    }}
+    if (data.fields.length) showField(0);
+  </script>
+</body>
+</html>
+"""
+    path = out_dir / "review.html"
+    path.write_text(html_text, encoding="utf-8")
+    return path
 
 
 def write_customer_pack_readme(manifest: dict[str, object], out_dir: Path) -> Path:
@@ -3665,6 +4591,10 @@ def write_customer_pdf_pack(
     timeout_seconds: float | None = None,
     health_cache_path: Path | None = None,
     use_health_cache: bool = False,
+    result_cache_dir: Path | None = None,
+    use_result_cache: bool = False,
+    include_field_evidence: bool = True,
+    include_review_html: bool = True,
 ) -> dict[str, object]:
     """Build a customer-facing PDF pack with text, vote, tables, layout, and metadata."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -3691,6 +4621,8 @@ def write_customer_pdf_pack(
         timeout_seconds=timeout_seconds,
         health_cache_path=health_cache_path,
         use_health_cache=use_health_cache,
+        result_cache_dir=result_cache_dir,
+        use_result_cache=use_result_cache,
     )
     written.extend(probe_written)
     ready_parser_names = ready_parsers_from_probe(preflight_probe)
@@ -3710,6 +4642,8 @@ def write_customer_pdf_pack(
         timeout_seconds=timeout_seconds,
         health_cache_path=health_cache_path,
         use_health_cache=use_health_cache,
+        result_cache_dir=result_cache_dir,
+        use_result_cache=use_result_cache,
     )
     vote_payload = build_vote_payload(
         file_path,
@@ -3745,29 +4679,28 @@ def write_customer_pdf_pack(
             layout_payload = {"enabled": True, "page_count": 0, "output": None, "error": repr(exc)}
 
     vote_written = write_vote_outputs(vote_payload, normalized_texts, out_dir, "all")
-    customer_written = write_customer_outputs(vote_payload, normalized_texts, out_dir, "all", layout, field_fusion)
     written.extend(vote_written)
-    written.extend(customer_written)
 
     tables_payload: dict[str, object] = {"enabled": include_tables, "table_count": 0, "outputs": {}, "error": None}
+    table_vote_payload: dict[str, object] | None = None
     if include_tables:
         try:
             page_count = get_pdf_page_count(file_path)
             page_indices = resolve_page_indices(table_pages, page_count, default_all=True)
             tables_dir = out_dir / "tables"
-            table_vote = build_table_vote_payload(
+            table_vote_payload = build_table_vote_payload(
                 file_path,
                 page_indices,
                 ["pdfplumber", "pdfplumber-text", "pymupdf-text"],
             )
-            table_written = write_table_vote_outputs(table_vote, tables_dir, "all")
+            table_written = write_table_vote_outputs(table_vote_payload, tables_dir, "all")
             written.extend(table_written)
-            tables = table_vote.get("best_tables") if isinstance(table_vote.get("best_tables"), list) else []
+            tables = table_vote_payload.get("best_tables") if isinstance(table_vote_payload.get("best_tables"), list) else []
             tables_payload = {
                 "enabled": True,
                 "page_count": len(page_indices),
                 "table_count": len(tables),
-                "winner": table_vote.get("winner"),
+                "winner": table_vote_payload.get("winner"),
                 "outputs": {
                     "vote_report": str(tables_dir / "table_vote_report.md"),
                     "vote_report_json": str(tables_dir / "table_vote_report.json"),
@@ -3781,6 +4714,32 @@ def write_customer_pdf_pack(
             diagnostics.append(f"Table extraction failed: {exc!r}")
             tables_payload = {"enabled": True, "table_count": 0, "outputs": {}, "error": repr(exc)}
 
+    delivery = build_customer_delivery(vote_payload, normalized_texts, layout, field_fusion)
+    evidence_payload: dict[str, object] = {"enabled": include_field_evidence, "image_count": 0, "outputs": {}, "error": None}
+    if delivery and include_field_evidence:
+        try:
+            evidence_payload = write_field_evidence_pack(file_path, delivery, out_dir)
+            evidence_outputs = evidence_payload.get("outputs") if isinstance(evidence_payload.get("outputs"), dict) else {}
+            for path_value in evidence_outputs.values():
+                if path_value:
+                    written.append(Path(str(path_value)))
+        except Exception as exc:
+            diagnostics.append(f"Field evidence failed: {exc!r}")
+            evidence_payload = {"enabled": True, "image_count": 0, "outputs": {}, "error": repr(exc)}
+
+    review_payload: dict[str, object] = {"enabled": include_review_html, "output": None, "error": None}
+    if delivery and include_review_html:
+        try:
+            review_path = write_review_html(file_path, delivery, out_dir, table_vote_payload)
+            written.append(review_path)
+            review_payload = {"enabled": True, "output": str(review_path), "error": None}
+        except Exception as exc:
+            diagnostics.append(f"Review HTML failed: {exc!r}")
+            review_payload = {"enabled": True, "output": None, "error": repr(exc)}
+
+    customer_written = write_customer_delivery_outputs(delivery, out_dir, "all") if delivery else []
+    written.extend(customer_written)
+
     winner = vote_payload.get("winner") if isinstance(vote_payload.get("winner"), dict) else {}
     manifest = {
         "version": __version__,
@@ -3789,8 +4748,24 @@ def write_customer_pdf_pack(
         "source_file": str(file_path),
         "actual_file": str(actual_path),
         "profile": profile,
+        "schema_version": CUSTOMER_BEST_SCHEMA_VERSION,
         "start_page": start_page,
         "max_pages": max_pages,
+        "options": {
+            "probe_max_pages": probe_max_pages,
+            "table_pages": table_pages,
+            "layout_max_pages": layout_max_pages,
+            "include_tables": include_tables,
+            "include_layout": include_layout,
+            "include_field_evidence": include_field_evidence,
+            "include_review_html": include_review_html,
+            "field_fusion": field_fusion,
+            "timeout_seconds": timeout_seconds,
+            "parser_health_cache": use_health_cache,
+            "health_cache_path": str(health_cache_path) if use_health_cache and health_cache_path else None,
+            "result_cache": use_result_cache,
+            "result_cache_dir": str(result_cache_dir) if use_result_cache and result_cache_dir else None,
+        },
         "metadata": metadata,
         "vote": {
             "winner": winner,
@@ -3799,6 +4774,8 @@ def write_customer_pdf_pack(
         },
         "tables": tables_payload,
         "layout": layout_payload,
+        "field_evidence": evidence_payload,
+        "review_html": review_payload,
         "diagnostics": diagnostics,
         "outputs": {
             "metadata": str(metadata_path),
@@ -3808,7 +4785,10 @@ def write_customer_pdf_pack(
             "vote_report_json": str(out_dir / "vote_report.json"),
             "best": [str(out_dir / f"best.{suffix}") for suffix in ["md", "txt", "json"]],
             "customer_best": [str(out_dir / f"customer_best.{suffix}") for suffix in ["md", "txt", "json"] if (out_dir / f"customer_best.{suffix}").exists()],
+            "customer_schema": str(out_dir / "customer_best.schema.json") if (out_dir / "customer_best.schema.json").exists() else None,
             "preflight_probe": str(probe_dir / "probe_report.md"),
+            "field_evidence": evidence_payload.get("outputs") if isinstance(evidence_payload, dict) else None,
+            "review_html": review_payload.get("output") if isinstance(review_payload, dict) else None,
             "tables": tables_payload.get("outputs"),
             "layout": layout_payload.get("output"),
             "page_map": layout_payload.get("page_map"),
@@ -3830,6 +4810,189 @@ def safe_report_name(value: object, fallback: str) -> str:
     return safe[:80] or fallback
 
 
+def golden_case_id(file_path: Path, root: Path | None = None) -> str:
+    """Build a stable readable case id for a PDF path."""
+    try:
+        rel = file_path.relative_to(root) if root else file_path.name
+    except ValueError:
+        rel = file_path.name
+    raw = str(rel).replace("\\", "_").replace("/", "_")
+    return safe_report_name(Path(raw).with_suffix("").as_posix(), safe_filename_part(file_path.stem, "case"))
+
+
+def infer_exam_golden_metadata(file_path: Path, roots: list[Path] | None = None) -> dict[str, object]:
+    """Infer lightweight exam-PDF metadata from directory and filename."""
+    parts = [file_path.stem, *[part for part in file_path.parts if part]]
+    joined = " ".join(parts)
+    year_match = re.search(r"(20[0-9]{2})", joined)
+    year = year_match.group(1) if year_match else None
+    season = "上半年" if "上半年" in joined else "下半年" if "下半年" in joined else None
+    section = "上午" if "上午" in joined else "案例" if "案例" in joined else "论文" if "论文" in joined else None
+    if section is None and "模拟" in joined:
+        section = "模拟题"
+    chapter_match = re.search(r"第([一二三四五六七八九十0-9]+)章", joined)
+    round_name = "第2套" if "第2套" in joined or "第二轮" in joined else "第1套" if "第1" in joined or "第1 套" in joined else None
+    category = "mock" if "模拟" in joined or "题库" in joined else "past_exam"
+    source_root = None
+    if roots:
+        for root in roots:
+            try:
+                file_path.relative_to(root)
+                source_root = str(root)
+                break
+            except ValueError:
+                continue
+    return {
+        "category": category,
+        "year": year,
+        "season": season,
+        "section": section,
+        "chapter": chapter_match.group(0) if chapter_match else None,
+        "round": round_name,
+        "source_root": source_root,
+    }
+
+
+def int_to_chinese(value: int) -> str:
+    """Convert a small positive integer to common Chinese numerals."""
+    digits = "零一二三四五六七八九"
+    if value <= 0:
+        return str(value)
+    if value < 10:
+        return digits[value]
+    if value == 10:
+        return "十"
+    if value < 20:
+        return "十" + digits[value % 10]
+    if value < 100:
+        tens, ones = divmod(value, 10)
+        return digits[tens] + "十" + (digits[ones] if ones else "")
+    return str(value)
+
+
+def golden_keywords_for_pdf(file_path: Path, metadata: dict[str, object]) -> list[str]:
+    """Build conservative keyword expectations for exam or mock PDFs."""
+    name = file_path.stem
+    keywords: list[str] = []
+    for token in ["系统规划与管理师", "系统规划", "真题", "模拟题", "答案", "解析", "案例", "论文", "上午"]:
+        if token in name and token not in keywords:
+            keywords.append(token)
+    for key in ["year", "season", "section", "chapter"]:
+        value = metadata.get(key)
+        if value and str(value) not in keywords:
+            keywords.append(str(value))
+        if key == "chapter" and value:
+            digit_match = re.search(r"第([0-9]+)章", str(value))
+            if digit_match:
+                chinese_number = int_to_chinese(int(digit_match.group(1)))
+                alt = f"第{chinese_number}章"
+                if alt not in keywords:
+                    keywords.append(alt)
+    if not any(token in keywords for token in ["系统规划与管理师", "系统规划"]):
+        keywords.append("系统")
+    return keywords[:8]
+
+
+def build_golden_case_payload(
+    file_path: Path,
+    root: Path | None,
+    parsers: str,
+    max_pages: int,
+    min_quality: float,
+    min_chars: int,
+    required_keywords: list[str] | None = None,
+    name_prefix: str | None = None,
+    roots: list[Path] | None = None,
+) -> dict[str, object]:
+    """Build one generic PDF golden case payload."""
+    metadata = infer_exam_golden_metadata(file_path, roots)
+    keywords = required_keywords if required_keywords is not None else golden_keywords_for_pdf(file_path, metadata)
+    case_id = golden_case_id(file_path, root)
+    name = f"{name_prefix}-{case_id}" if name_prefix else case_id
+    return {
+        "name": name,
+        "file": str(file_path.resolve()),
+        "command": "vote",
+        "profile": "none",
+        "parsers": parsers,
+        "max_pages": max_pages,
+        "expected": {
+            "min_vote_score": min_quality,
+            "quality_gate_passed": True,
+            "min_non_space_chars": min_chars,
+            "quality_label_not": ["empty", "bad"],
+            "text_contains_any": keywords,
+        },
+        "metadata": metadata,
+    }
+
+
+def collect_golden_pdf_files(roots: list[Path], recursive: bool = True) -> list[Path]:
+    """Collect PDF files from one or more roots."""
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for raw_root in roots:
+        root = raw_root.resolve()
+        candidates: list[Path]
+        if root.is_file() and root.suffix.lower() == ".pdf":
+            candidates = [root]
+        elif root.is_dir():
+            pattern = "**/*.pdf" if recursive else "*.pdf"
+            candidates = sorted(path for path in root.glob(pattern) if path.is_file())
+        else:
+            candidates = []
+        for candidate in candidates:
+            resolved = candidate.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                files.append(resolved)
+    return files
+
+
+def write_golden_library_readme(manifest: dict[str, object], out_dir: Path) -> Path:
+    """Write a human-readable README for an initialized golden library."""
+    rows = manifest.get("cases") if isinstance(manifest.get("cases"), list) else []
+    lines = [
+        "# Golden PDF Case Library",
+        "",
+        f"- Version: `{manifest.get('version')}`",
+        f"- Generated at: `{manifest.get('generated_at')}`",
+        f"- Case count: `{manifest.get('case_count')}`",
+        f"- PDF count: `{manifest.get('pdf_count')}`",
+        f"- Parsers: `{manifest.get('parsers')}`",
+        f"- Max pages: `{manifest.get('max_pages')}`",
+        "",
+        "## Run",
+        "",
+        "```powershell",
+        f"python scripts\\parse_document_compare.py eval-golden \"{out_dir}\" --recursive --timeout 120 --parser-health-cache --result-cache",
+        "```",
+        "",
+        "## Cases",
+        "",
+        "| Case | Category | Year | Section | PDF |",
+        "|---|---|---|---|---|",
+    ]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        lines.append(
+            f"| `{row.get('name')}` | {metadata.get('category') or ''} | {metadata.get('year') or ''} | "
+            f"{metadata.get('section') or ''} | `{row.get('file')}` |"
+        )
+    path = out_dir / "README.md"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def write_golden_library_index(manifest: dict[str, object], out_dir: Path) -> tuple[Path, Path]:
+    """Write index JSON and Markdown for a generated golden library."""
+    index_json = write_json_file(out_dir / "index.json", manifest)
+    readme = write_golden_library_readme(manifest, out_dir)
+    return index_json, readme
+
+
 def load_golden_case_files(path: Path, recursive: bool = False) -> list[Path]:
     """Return candidate golden case JSON files."""
     if path.is_file():
@@ -3838,9 +5001,8 @@ def load_golden_case_files(path: Path, recursive: bool = False) -> list[Path]:
         return []
     pattern = "**/*.json" if recursive else "*.json"
     case_files: list[Path] = []
-    skipped_names = {"golden_report.json", "vote_report.json", "probe_report.json", "manifest.json", "metadata.json", "index.json"}
     for candidate in sorted(path.glob(pattern)):
-        if not candidate.is_file() or candidate.name in skipped_names:
+        if not candidate.is_file() or candidate.name in GOLDEN_REPORT_NAMES:
             continue
         try:
             data = json.loads(candidate.read_text(encoding="utf-8"))
@@ -3875,6 +5037,11 @@ def evaluate_vote_expectations(payload: dict[str, object], expected: dict[str, o
     """Evaluate a vote payload against golden expectations."""
     expected = expected or {}
     winner = payload.get("winner") if isinstance(payload.get("winner"), dict) else {}
+    winner_text = ""
+    if winner.get("parser"):
+        texts = payload.get("_normalized_texts")
+        if isinstance(texts, dict):
+            winner_text = str(texts.get(str(winner.get("parser"))) or "")
     checks: list[dict[str, object]] = []
 
     def add_check(name: str, actual: object, expected_value: object, passed: bool) -> None:
@@ -3905,6 +5072,60 @@ def evaluate_vote_expectations(payload: dict[str, object], expected: dict[str, o
         gate = payload.get("quality_gate") if isinstance(payload.get("quality_gate"), dict) else {}
         actual = bool(gate.get("passed"))
         add_check("quality_gate_passed", actual, expected.get("quality_gate_passed"), actual is bool(expected.get("quality_gate_passed")))
+
+    if "min_non_space_chars" in expected:
+        actual_chars = int(winner.get("non_space_chars") or 0)
+        expected_chars = int(expected.get("min_non_space_chars") or 0)
+        add_check("min_non_space_chars", actual_chars, expected_chars, actual_chars >= expected_chars)
+
+    if "min_chars" in expected:
+        actual_chars = int(winner.get("chars") or 0)
+        expected_chars = int(expected.get("min_chars") or 0)
+        add_check("min_chars", actual_chars, expected_chars, actual_chars >= expected_chars)
+
+    if "quality_label" in expected:
+        actual = winner.get("quality_label")
+        expected_label = expected.get("quality_label")
+        allowed = expected_label if isinstance(expected_label, list) else [expected_label]
+        add_check("quality_label", actual, expected_label, actual in allowed)
+
+    if "quality_label_not" in expected:
+        actual = winner.get("quality_label")
+        forbidden = expected.get("quality_label_not")
+        forbidden_values = forbidden if isinstance(forbidden, list) else [forbidden]
+        add_check("quality_label_not", actual, forbidden, actual not in forbidden_values)
+
+    if "max_duplicate_line_ratio" in expected:
+        repetition = winner.get("repetition_metrics") if isinstance(winner.get("repetition_metrics"), dict) else {}
+        actual = float(repetition.get("duplicate_line_ratio") or 0.0)
+        expected_ratio = float(expected.get("max_duplicate_line_ratio") or 0.0)
+        add_check("max_duplicate_line_ratio", actual, expected_ratio, actual <= expected_ratio)
+
+    if "max_repeated_ngram_ratio" in expected:
+        repetition = winner.get("repetition_metrics") if isinstance(winner.get("repetition_metrics"), dict) else {}
+        actual = float(repetition.get("repeated_ngram_ratio") or 0.0)
+        expected_ratio = float(expected.get("max_repeated_ngram_ratio") or 0.0)
+        add_check("max_repeated_ngram_ratio", actual, expected_ratio, actual <= expected_ratio)
+
+    if "text_contains" in expected:
+        expected_text = str(expected.get("text_contains") or "")
+        add_check("text_contains", expected_text if expected_text in winner_text else None, expected_text, bool(expected_text and expected_text in winner_text))
+
+    if "text_contains_all" in expected:
+        expected_items = expected.get("text_contains_all")
+        items = [str(item) for item in expected_items] if isinstance(expected_items, list) else [str(expected_items)]
+        missing = [item for item in items if item and item not in winner_text]
+        add_check("text_contains_all", {"missing": missing}, items, not missing)
+
+    if "text_contains_any" in expected:
+        expected_items = expected.get("text_contains_any")
+        items = [str(item) for item in expected_items] if isinstance(expected_items, list) else [str(expected_items)]
+        matched = [item for item in items if item and item in winner_text]
+        add_check("text_contains_any", {"matched": matched}, items, bool(matched))
+
+    if "text_regex" in expected:
+        pattern = str(expected.get("text_regex") or "")
+        add_check("text_regex", pattern if pattern and re.search(pattern, winner_text) else None, pattern, bool(pattern and re.search(pattern, winner_text)))
 
     invoice_fields = winner.get("invoice_fields") if isinstance(winner.get("invoice_fields"), dict) else {}
     validation = invoice_fields.get("validation") if isinstance(invoice_fields.get("validation"), dict) else {}
@@ -3975,6 +5196,7 @@ def cmd_eval_golden(args: argparse.Namespace) -> int:
         out_dir = root.parent / "golden_eval_output"
     out_dir.mkdir(parents=True, exist_ok=True)
     health_cache_path = Path(args.health_cache).resolve() if args.health_cache else default_parser_health_cache_path(out_dir)
+    result_cache_dir = Path(args.result_cache_dir).resolve() if args.result_cache_dir else default_parser_result_cache_dir(out_dir)
 
     rows: list[dict[str, object]] = []
     print("Golden PDF 评测")
@@ -4021,6 +5243,8 @@ def cmd_eval_golden(args: argparse.Namespace) -> int:
                 timeout_seconds=args.timeout,
                 health_cache_path=health_cache_path,
                 use_health_cache=bool(args.parser_health_cache),
+                result_cache_dir=result_cache_dir,
+                use_result_cache=bool(args.result_cache),
             )
             vote_payload = build_vote_payload(
                 file_path,
@@ -4034,10 +5258,12 @@ def cmd_eval_golden(args: argparse.Namespace) -> int:
                 profile,
             )
             written = write_vote_outputs(vote_payload, normalized_texts, case_dir, "all")
+            vote_payload["_normalized_texts"] = normalized_texts
             evaluation = evaluate_vote_expectations(
                 vote_payload,
                 case.get("expected") if isinstance(case.get("expected"), dict) else {},
             )
+            vote_payload.pop("_normalized_texts", None)
             winner = vote_payload.get("winner") if isinstance(vote_payload.get("winner"), dict) else {}
             checks = evaluation.get("checks") if isinstance(evaluation.get("checks"), list) else []
             row = {
@@ -4088,6 +5314,99 @@ def cmd_eval_golden(args: argparse.Namespace) -> int:
     print(f"报告：{md_path}")
     print(f"机器可读报告：{json_path}")
     return 0 if report["failed_count"] == 0 else 2
+
+
+def cmd_init_golden(args: argparse.Namespace) -> int:
+    """Initialize generic PDF golden case JSON files from directories."""
+    roots = [path.resolve() for path in args.paths]
+    out_dir = args.out_dir.resolve()
+    pdf_files = collect_golden_pdf_files(roots, recursive=bool(args.recursive))
+    if not pdf_files:
+        print("错误：没有找到 PDF 文件", file=sys.stderr)
+        return 1
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cases_dir = out_dir / "cases"
+    cases_dir.mkdir(parents=True, exist_ok=True)
+
+    max_pages = args.max_pages
+    parser_names = [part.strip() for part in (args.parsers or GOLDEN_DEFAULT_PARSERS).split(",") if part.strip()]
+    if args.include_ocr and "ocr-tesseract" not in parser_names:
+        parser_names.append("ocr-tesseract")
+    parsers = ",".join(parser_names)
+    min_chars = int(args.min_non_space_chars)
+    min_quality = float(args.min_quality)
+    manifest_cases: list[dict[str, object]] = []
+    written: list[Path] = []
+    for index, pdf_path in enumerate(pdf_files, 1):
+        root_for_case = next((root for root in roots if root.is_dir() and pdf_path.is_relative_to(root)), None)
+        payload = build_golden_case_payload(
+            pdf_path,
+            root_for_case,
+            parsers,
+            max_pages,
+            min_quality,
+            min_chars,
+            name_prefix=args.name_prefix,
+            roots=roots,
+        )
+        case_name = safe_report_name(payload.get("name"), f"case_{index:03d}")
+        case_path = cases_dir / f"{index:03d}_{case_name}.json"
+        if case_path.exists() and not args.force:
+            raise FileExistsError(f"case 已存在，使用 --force 覆盖：{case_path}")
+        write_json_file(case_path, payload)
+        written.append(case_path)
+        manifest_cases.append({
+            "name": payload.get("name"),
+            "case_file": str(case_path),
+            "file": str(pdf_path),
+            "size_bytes": pdf_path.stat().st_size,
+            "metadata": payload.get("metadata"),
+            "expected": payload.get("expected"),
+        })
+
+    categories = Counter(
+        str((row.get("metadata") or {}).get("category"))
+        for row in manifest_cases
+        if isinstance(row.get("metadata"), dict)
+    )
+    sections = Counter(
+        str((row.get("metadata") or {}).get("section"))
+        for row in manifest_cases
+        if isinstance(row.get("metadata"), dict) and (row.get("metadata") or {}).get("section")
+    )
+    years = Counter(
+        str((row.get("metadata") or {}).get("year"))
+        for row in manifest_cases
+        if isinstance(row.get("metadata"), dict) and (row.get("metadata") or {}).get("year")
+    )
+    manifest = {
+        "version": __version__,
+        "type": "golden-case-library",
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "roots": [str(root) for root in roots],
+        "out_dir": str(out_dir),
+        "case_count": len(written),
+        "pdf_count": len(pdf_files),
+        "parsers": parsers,
+        "max_pages": max_pages,
+        "min_quality": min_quality,
+        "min_non_space_chars": min_chars,
+        "summary": {
+            "categories": dict(categories),
+            "sections": dict(sections),
+            "years": dict(years),
+        },
+        "cases": manifest_cases,
+    }
+    index_json, readme = write_golden_library_index(manifest, out_dir)
+    print("Golden 样本库已生成")
+    print(f"PDF 数：{len(pdf_files)}")
+    print(f"Case 数：{len(written)}")
+    print(f"目录：{out_dir}")
+    print(f"索引：{index_json}")
+    print(f"说明：{readme}")
+    print(f"评测命令：python scripts\\parse_document_compare.py eval-golden \"{out_dir}\" --recursive --timeout 120 --parser-health-cache --result-cache")
+    return 0
 
 
 def probe_status_for_result(
@@ -4286,6 +5605,8 @@ def run_parser_probe(
     timeout_seconds: float | None = None,
     health_cache_path: Path | None = None,
     use_health_cache: bool = False,
+    result_cache_dir: Path | None = None,
+    use_result_cache: bool = False,
 ) -> tuple[dict[str, object], list[Path]]:
     """Run parser runtime probe and write probe reports."""
     results, normalized_texts, actual_path = collect_parser_outputs(
@@ -4301,6 +5622,8 @@ def run_parser_probe(
         timeout_seconds=timeout_seconds,
         health_cache_path=health_cache_path,
         use_health_cache=use_health_cache,
+        result_cache_dir=result_cache_dir,
+        use_result_cache=use_result_cache,
     )
     payload = build_probe_payload(
         file_path,
@@ -5978,6 +7301,8 @@ def cmd_vote(args: argparse.Namespace) -> int:
     preflight_written: list[Path] = []
     health_cache_path = Path(args.health_cache).resolve() if args.health_cache else default_parser_health_cache_path(out_dir)
     use_health_cache = bool(args.parser_health_cache)
+    result_cache_dir = Path(args.result_cache_dir).resolve() if args.result_cache_dir else default_parser_result_cache_dir(out_dir)
+    use_result_cache = bool(args.result_cache)
     if args.probe_before_vote:
         probe_max_pages = None if args.probe_max_pages == 0 else args.probe_max_pages
         probe_out_dir = out_dir / "preflight_probe"
@@ -5997,6 +7322,8 @@ def cmd_vote(args: argparse.Namespace) -> int:
             timeout_seconds=args.timeout,
             health_cache_path=health_cache_path,
             use_health_cache=use_health_cache,
+            result_cache_dir=result_cache_dir,
+            use_result_cache=use_result_cache,
         )
         ready_parser_names = ready_parsers_from_probe(preflight_probe)
         if not ready_parser_names:
@@ -6022,6 +7349,8 @@ def cmd_vote(args: argparse.Namespace) -> int:
         timeout_seconds=args.timeout,
         health_cache_path=health_cache_path,
         use_health_cache=use_health_cache,
+        result_cache_dir=result_cache_dir,
+        use_result_cache=use_result_cache,
     )
     payload = build_vote_payload(
         file_path,
@@ -6037,7 +7366,8 @@ def cmd_vote(args: argparse.Namespace) -> int:
     )
     layout: dict[str, object] | None = None
     layout_written: list[Path] = []
-    if args.customer and args.field_layout:
+    needs_layout = args.customer and (args.field_layout or args.field_evidence or args.review_html)
+    if needs_layout:
         try:
             layout_max_pages = None if args.field_layout_max_pages == 0 else args.field_layout_max_pages
             layout = pdf_layout_json(file_path, start_page, layout_max_pages)
@@ -6050,7 +7380,18 @@ def cmd_vote(args: argparse.Namespace) -> int:
     written.extend(preflight_written)
     written.extend(layout_written)
     if args.customer:
-        written.extend(write_customer_outputs(payload, normalized_texts, out_dir, args.format, layout, not args.no_field_fusion))
+        delivery = build_customer_delivery(payload, normalized_texts, layout, not args.no_field_fusion)
+        if delivery and args.field_evidence:
+            evidence_payload = write_field_evidence_pack(file_path, delivery, out_dir)
+            evidence_outputs = evidence_payload.get("outputs") if isinstance(evidence_payload.get("outputs"), dict) else {}
+            for path_value in evidence_outputs.values():
+                if path_value:
+                    written.append(Path(str(path_value)))
+        if delivery and args.review_html:
+            review_path = write_review_html(file_path, delivery, out_dir, None)
+            written.append(review_path)
+        if delivery:
+            written.extend(write_customer_delivery_outputs(delivery, out_dir, args.format))
     winner = payload.get("winner") if isinstance(payload.get("winner"), dict) else None
     if winner:
         print(f"投票胜出：{winner.get('parser')}，得分：{winner.get('vote_score')}")
@@ -6100,6 +7441,7 @@ def cmd_customer_pack(args: argparse.Namespace) -> int:
 
     try:
         health_cache_path = Path(args.health_cache).resolve() if args.health_cache else default_parser_health_cache_path(out_dir)
+        result_cache_dir = Path(args.result_cache_dir).resolve() if args.result_cache_dir else default_parser_result_cache_dir(out_dir)
         manifest = write_customer_pdf_pack(
             file_path,
             out_dir,
@@ -6120,6 +7462,10 @@ def cmd_customer_pack(args: argparse.Namespace) -> int:
             timeout_seconds=args.timeout,
             health_cache_path=health_cache_path,
             use_health_cache=bool(args.parser_health_cache),
+            result_cache_dir=result_cache_dir,
+            use_result_cache=bool(args.result_cache),
+            include_field_evidence=not args.no_field_evidence,
+            include_review_html=not args.no_review_html,
         )
     except Exception as exc:
         print(f"错误：customer-pack 失败：{exc}", file=sys.stderr)
@@ -6169,6 +7515,7 @@ def cmd_batch_customer_pack(args: argparse.Namespace) -> int:
     probe_max_pages = None if args.probe_max_pages == 0 else args.probe_max_pages
     layout_max_pages = None if args.layout_max_pages == 0 else args.layout_max_pages
     health_cache_path = Path(args.health_cache).resolve() if args.health_cache else default_parser_health_cache_path(out_dir)
+    result_cache_dir = Path(args.result_cache_dir).resolve() if args.result_cache_dir else default_parser_result_cache_dir(out_dir)
 
     print("批量 PDF 客户交付包")
     print(f"目录：{input_dir}")
@@ -6201,6 +7548,10 @@ def cmd_batch_customer_pack(args: argparse.Namespace) -> int:
                 timeout_seconds=args.timeout,
                 health_cache_path=health_cache_path,
                 use_health_cache=bool(args.parser_health_cache),
+                result_cache_dir=result_cache_dir,
+                use_result_cache=bool(args.result_cache),
+                include_field_evidence=not args.no_field_evidence,
+                include_review_html=not args.no_review_html,
             )
             manifests.append(manifest)
             print("ok")
@@ -6303,6 +7654,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
     print(f"输出目录：{out_dir}")
 
     health_cache_path = Path(args.health_cache).resolve() if args.health_cache else default_parser_health_cache_path(out_dir)
+    result_cache_dir = Path(args.result_cache_dir).resolve() if args.result_cache_dir else default_parser_result_cache_dir(out_dir)
     payload, _written = run_parser_probe(
         file_path,
         fmt,
@@ -6318,6 +7670,8 @@ def cmd_probe(args: argparse.Namespace) -> int:
         timeout_seconds=args.timeout,
         health_cache_path=health_cache_path,
         use_health_cache=bool(args.parser_health_cache),
+        result_cache_dir=result_cache_dir,
+        use_result_cache=bool(args.result_cache),
     )
     json_path, md_path = out_dir / "probe_report.json", out_dir / "probe_report.md"
     summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
@@ -7831,7 +9185,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="客户交付 best 输出格式：md/txt/json/all。默认 md")
     profile_choices = ["auto", "invoice", "contract", "bank_statement", "quotation", "purchase_order", "report", "annual_report", "none"]
     p_vote.add_argument("--profile", choices=profile_choices, default="auto",
-                        help="投票领域加权 profile。invoice 会启用字段校验加权；其它业务 profile 用于分类/策略报告。默认 auto")
+                        help="投票领域加权 profile。invoice 会启用字段校验加权；其它业务 profile 会做轻量结构化抽取。默认 auto")
     p_vote.add_argument("--customer", action="store_true",
                         help="额外输出 customer_best.md/txt/json；发票 profile 下输出结构化客户交付稿")
     p_vote.add_argument("--no-field-fusion", action="store_true",
@@ -7855,6 +9209,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="启用解析器健康缓存，跳过 24 小时内同文件同页段近期失败或超时的解析器")
     p_vote.add_argument("--health-cache", default=None,
                         help="解析器健康缓存 JSON 路径；默认输出目录下 .parser_health_cache.json")
+    p_vote.add_argument("--result-cache", action="store_true",
+                        help="启用解析结果缓存，同一 PDF 同一 parser/page 范围不重复重解析")
+    p_vote.add_argument("--result-cache-dir", default=None,
+                        help="解析结果缓存目录；默认输出目录下 .parser_result_cache")
+    p_vote.add_argument("--field-evidence", action="store_true",
+                        help="配合 --customer 生成字段截图证据包 field_evidence/")
+    p_vote.add_argument("--review-html", action="store_true",
+                        help="配合 --customer 生成本地可视化审阅页 review.html")
     p_vote.add_argument("--parallel", action="store_true", help="并行执行")
 
     # --- customer-pack ---
@@ -7869,7 +9231,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_pack_customer.add_argument("--parsers", default=None,
                                  help=f"逗号分隔解析器。默认全部 PDF 解析器：{','.join(get_parsers_for_format('pdf'))}")
     p_pack_customer.add_argument("--profile", choices=profile_choices, default="auto",
-                                 help="投票领域加权 profile。invoice 会启用字段校验加权；其它业务 profile 用于分类/策略报告。默认 auto")
+                                 help="投票领域加权 profile。invoice 会启用字段校验加权；其它业务 profile 会做轻量结构化抽取。默认 auto")
     p_pack_customer.add_argument("--min-quality", type=float, default=0.5, help="最低质量评分门槛，默认 0.5")
     p_pack_customer.add_argument("--fail-on-bad", action="store_true", help="胜出结果标签为 empty/bad 时返回退出码 2")
     p_pack_customer.add_argument("--similarity-chars", type=int, default=50000, help="投票共识相似度比较字符数")
@@ -7883,6 +9245,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_pack_customer.add_argument("--no-layout", action="store_true", help="不输出 layout.json/page_map.json")
     p_pack_customer.add_argument("--no-field-fusion", action="store_true",
                                  help="关闭发票字段级投票融合，customer_best 只使用整份投票胜出解析器字段")
+    p_pack_customer.add_argument("--no-field-evidence", action="store_true", help="不生成字段截图证据包")
+    p_pack_customer.add_argument("--no-review-html", action="store_true", help="不生成可视化 HTML 审阅页")
+    p_pack_customer.add_argument("--result-cache", action="store_true",
+                                 help="启用解析结果缓存，同一 PDF 同一 parser/page 范围不重复重解析")
+    p_pack_customer.add_argument("--result-cache-dir", default=None,
+                                 help="解析结果缓存目录；默认输出目录下 .parser_result_cache")
     p_pack_customer.add_argument("--parallel", action="store_true", help="并行执行解析器")
 
     # --- probe ---
@@ -7904,6 +9272,10 @@ def build_parser() -> argparse.ArgumentParser:
                          help="启用解析器健康缓存，跳过 24 小时内同文件同页段近期失败或超时的解析器")
     p_probe.add_argument("--health-cache", default=None,
                          help="解析器健康缓存 JSON 路径；默认输出目录下 .parser_health_cache.json")
+    p_probe.add_argument("--result-cache", action="store_true",
+                         help="启用解析结果缓存，同一文件同一 parser/page 范围不重复重解析")
+    p_probe.add_argument("--result-cache-dir", default=None,
+                         help="解析结果缓存目录；默认输出目录下 .parser_result_cache")
     p_probe.add_argument("--parallel", action="store_true", help="并行执行")
 
     # --- convert ---
@@ -7961,6 +9333,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_table_vote.add_argument("--out-dir", type=Path, default=None,
                               help="输出目录（默认 <文件名>_table_vote）")
 
+    # --- init-golden ---
+    p_init_golden = subparsers.add_parser("init-golden", help="从 PDF 文件或目录初始化 Golden case 样本库")
+    p_init_golden.add_argument("paths", nargs="+", type=Path, help="PDF 文件或目录，可传多个")
+    p_init_golden.add_argument("--out-dir", type=Path, required=True, help="Golden 样本库输出目录")
+    p_init_golden.add_argument("--recursive", action="store_true", help="递归扫描目录中的 PDF")
+    p_init_golden.add_argument("--parsers", default=GOLDEN_DEFAULT_PARSERS,
+                               help=f"用例默认解析器，逗号分隔。默认 {GOLDEN_DEFAULT_PARSERS}")
+    p_init_golden.add_argument("--include-ocr", action="store_true",
+                               help="把 ocr-tesseract 加入每个 case 的 parser 列表，适合混有扫描件/坏文本层 PDF 的样本库")
+    p_init_golden.add_argument("--max-pages", type=int, default=3,
+                               help="每个 case 默认评测页数；0=全量。默认 3")
+    p_init_golden.add_argument("--min-quality", type=float, default=0.5,
+                               help="每个 case 默认最低投票分。默认 0.5")
+    p_init_golden.add_argument("--min-non-space-chars", type=int, default=120,
+                               help="每个 case 默认 winner 最少非空白字符数。默认 120")
+    p_init_golden.add_argument("--name-prefix", default=None, help="可选 case 名称前缀")
+    p_init_golden.add_argument("--force", action="store_true", help="覆盖已存在 case JSON")
+
     # --- eval-golden ---
     p_eval = subparsers.add_parser("eval-golden", help="运行 golden PDF 用例，评测投票策略是否退步")
     p_eval.add_argument("path", type=Path, help="golden case JSON 文件或目录")
@@ -7982,6 +9372,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="启用解析器健康缓存，跳过 24 小时内同文件同页段近期失败或超时的解析器")
     p_eval.add_argument("--health-cache", default=None,
                         help="解析器健康缓存 JSON 路径；默认输出目录下 .parser_health_cache.json")
+    p_eval.add_argument("--result-cache", action="store_true",
+                        help="启用解析结果缓存，同一 PDF 同一 parser/page 范围不重复重解析")
+    p_eval.add_argument("--result-cache-dir", default=None,
+                        help="解析结果缓存目录；默认输出目录下 .parser_result_cache")
     p_eval.add_argument("--parallel", action="store_true", help="并行执行解析器")
 
     # --- doctor ---
@@ -8139,7 +9533,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_batch_customer.add_argument("--parsers", default=None,
                                   help=f"逗号分隔解析器。默认全部 PDF 解析器：{','.join(get_parsers_for_format('pdf'))}")
     p_batch_customer.add_argument("--profile", choices=profile_choices, default="auto",
-                                  help="投票领域加权 profile。默认 auto")
+                                  help="投票领域加权 profile。invoice 会校验加权；其它业务 profile 会做轻量结构化抽取。默认 auto")
     p_batch_customer.add_argument("--min-quality", type=float, default=0.5, help="最低质量评分门槛，默认 0.5")
     p_batch_customer.add_argument("--fail-on-bad", action="store_true", help="胜出结果标签为 empty/bad 时返回失败")
     p_batch_customer.add_argument("--similarity-chars", type=int, default=50000, help="投票共识相似度比较字符数")
@@ -8153,6 +9547,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_batch_customer.add_argument("--no-layout", action="store_true", help="不输出 layout.json/page_map.json")
     p_batch_customer.add_argument("--no-field-fusion", action="store_true",
                                   help="关闭发票字段级投票融合，customer_best 只使用整份投票胜出解析器字段")
+    p_batch_customer.add_argument("--no-field-evidence", action="store_true", help="不生成字段截图证据包")
+    p_batch_customer.add_argument("--no-review-html", action="store_true", help="不生成可视化 HTML 审阅页")
+    p_batch_customer.add_argument("--result-cache", action="store_true",
+                                  help="启用解析结果缓存，同一 PDF 同一 parser/page 范围不重复重解析")
+    p_batch_customer.add_argument("--result-cache-dir", default=None,
+                                  help="解析结果缓存目录；默认输出目录下 .parser_result_cache")
     p_batch_customer.add_argument("--parallel", action="store_true", help="并行执行解析器")
 
     # --- qa ---
@@ -8193,7 +9593,7 @@ def main() -> int:
 
     # 向后兼容：无子命令时等同于 compare
     if len(sys.argv) > 1 and sys.argv[1] not in (
-        "compare", "vote", "customer-pack", "batch-customer-pack", "probe", "convert", "batch", "scan-dir", "tables", "table-vote", "eval-golden", "doctor", "metadata",
+        "compare", "vote", "customer-pack", "batch-customer-pack", "probe", "convert", "batch", "scan-dir", "tables", "table-vote", "init-golden", "eval-golden", "doctor", "metadata",
         "chunk", "render-pages", "ocr", "auto", "extract-fields", "export-xlsx",
         "layout-json", "verify-fields", "classify", "knowledge-pack", "batch-knowledge",
         "qa", "diff-docs",
@@ -8218,6 +9618,7 @@ def main() -> int:
         "scan-dir": cmd_scan_dir,
         "tables": cmd_tables,
         "table-vote": cmd_table_vote,
+        "init-golden": cmd_init_golden,
         "eval-golden": cmd_eval_golden,
         "doctor": cmd_doctor,
         "metadata": cmd_metadata,

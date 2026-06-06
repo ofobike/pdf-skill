@@ -51,6 +51,7 @@ class CliSurfaceTest(unittest.TestCase):
             "scan-dir",
             "tables",
             "table-vote",
+            "init-golden",
             "eval-golden",
             "doctor",
             "metadata",
@@ -91,6 +92,10 @@ class CliSurfaceTest(unittest.TestCase):
         self.assertIn("probe_min_quality", option_dests)
         self.assertIn("timeout", option_dests)
         self.assertIn("parser_health_cache", option_dests)
+        self.assertIn("result_cache", option_dests)
+        self.assertIn("result_cache_dir", option_dests)
+        self.assertIn("field_evidence", option_dests)
+        self.assertIn("review_html", option_dests)
 
     def test_eval_golden_command_exposes_regression_options(self):
         module = load_module()
@@ -111,6 +116,27 @@ class CliSurfaceTest(unittest.TestCase):
         self.assertIn("timeout", option_dests)
         self.assertIn("parser_health_cache", option_dests)
         self.assertIn("health_cache", option_dests)
+        self.assertIn("result_cache", option_dests)
+        self.assertIn("result_cache_dir", option_dests)
+
+    def test_init_golden_command_exposes_library_options(self):
+        module = load_module()
+        parser = module.build_parser()
+        subparsers_action = next(
+            action
+            for action in parser._actions
+            if getattr(action, "dest", None) == "command"
+        )
+        init_parser = subparsers_action.choices["init-golden"]
+        option_dests = {action.dest for action in init_parser._actions}
+
+        self.assertIn("paths", option_dests)
+        self.assertIn("out_dir", option_dests)
+        self.assertIn("recursive", option_dests)
+        self.assertIn("parsers", option_dests)
+        self.assertIn("include_ocr", option_dests)
+        self.assertIn("max_pages", option_dests)
+        self.assertIn("min_non_space_chars", option_dests)
 
     def test_customer_pack_command_exposes_complex_pdf_options(self):
         module = load_module()
@@ -131,6 +157,10 @@ class CliSurfaceTest(unittest.TestCase):
         self.assertIn("profile", option_dests)
         self.assertIn("timeout", option_dests)
         self.assertIn("parser_health_cache", option_dests)
+        self.assertIn("result_cache", option_dests)
+        self.assertIn("result_cache_dir", option_dests)
+        self.assertIn("no_field_evidence", option_dests)
+        self.assertIn("no_review_html", option_dests)
 
     def test_table_vote_and_batch_customer_pack_commands_expose_options(self):
         module = load_module()
@@ -153,6 +183,9 @@ class CliSurfaceTest(unittest.TestCase):
         self.assertIn("timeout", batch_dests)
         self.assertIn("parser_health_cache", batch_dests)
         self.assertIn("no_field_fusion", batch_dests)
+        self.assertIn("result_cache", batch_dests)
+        self.assertIn("no_field_evidence", batch_dests)
+        self.assertIn("no_review_html", batch_dests)
 
     def test_pdf_parser_registry_includes_markdown_parsers(self):
         module = load_module()
@@ -414,12 +447,13 @@ class CliSurfaceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = Path(tmp) / "customer"
             written = module.write_customer_outputs(payload, normalized, out_dir, "all")
-            self.assertEqual({path.name for path in written}, {"customer_best.md", "customer_best.txt", "customer_best.json"})
+            self.assertEqual({path.name for path in written}, {"customer_best.md", "customer_best.txt", "customer_best.json", "customer_best.schema.json"})
             customer_json = json.loads((out_dir / "customer_best.json").read_text(encoding="utf-8"))
 
         self.assertEqual(customer_json["type"], "customer_invoice_delivery")
         self.assertEqual(customer_json["invoice"]["invoice_number"], "123456789012")
         self.assertIn("field_confidence", customer_json)
+        self.assertIn("schema_version", customer_json)
         self.assertGreater(customer_json["field_confidence"]["invoice_number"]["confidence"], 0)
         self.assertEqual(customer_json["field_confidence"]["invoice_number"]["source_parser"], "clean_invoice")
 
@@ -555,6 +589,58 @@ class CliSurfaceTest(unittest.TestCase):
         self.assertTrue(delivery["audit"]["field_fusion"]["used"])
         self.assertIn("buyer_name", delivery["audit"]["field_fusion"]["changed_fields"])
 
+    def test_business_profile_customer_delivery_extracts_structured_fields(self):
+        module = load_module()
+        text = "\n".join([
+            "合同编号: HT-2026-001",
+            "甲方: 测试甲方有限公司",
+            "乙方: 测试乙方有限公司",
+            "签订日期: 2026年06月06日",
+            "合同金额: ￥1000.00",
+            "付款方式: 验收后30日内付款",
+        ])
+        results = [module.result_from_text("strong", text, 0.1)]
+        normalized = {"strong": module.normalize_text(text)}
+
+        payload = module.build_vote_payload(
+            ROOT / "contract.pdf",
+            ROOT / "contract.pdf",
+            "pdf",
+            results,
+            normalized,
+            50000,
+            0.5,
+            True,
+            profile="contract",
+        )
+        delivery = module.build_customer_delivery(payload, normalized)
+
+        self.assertEqual(payload["profile"]["resolved"], "contract")
+        self.assertEqual(delivery["type"], "customer_structured_delivery")
+        self.assertEqual(delivery["fields"]["contract_number"], "HT-2026-001")
+        self.assertGreater(payload["winner"]["business_score"], 0)
+
+    def test_customer_schema_and_evidence_outputs_are_written(self):
+        module = load_module()
+        delivery = {
+            "version": module.__version__,
+            "schema_version": module.CUSTOMER_BEST_SCHEMA_VERSION,
+            "type": "customer_best_text",
+            "generated_at": "2026-06-06 00:00:00",
+            "source_file": "sample.pdf",
+            "parser": "strong",
+            "text": "hello",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "customer"
+            written = module.write_customer_delivery_outputs(delivery, out_dir, "json")
+            schema = json.loads((out_dir / "customer_best.schema.json").read_text(encoding="utf-8"))
+            customer = json.loads((out_dir / "customer_best.json").read_text(encoding="utf-8"))
+
+        self.assertIn(out_dir / "customer_best.schema.json", written)
+        self.assertEqual(schema["properties"]["schema_version"]["const"], module.CUSTOMER_BEST_SCHEMA_VERSION)
+        self.assertEqual(customer["schema_version"], module.CUSTOMER_BEST_SCHEMA_VERSION)
+
     def test_vote_expectations_compare_invoice_fields(self):
         module = load_module()
         payload = {
@@ -585,6 +671,67 @@ class CliSurfaceTest(unittest.TestCase):
 
         self.assertTrue(evaluation["passed"])
         self.assertEqual(evaluation["check_count"], 6)
+
+    def test_vote_expectations_compare_generic_text_quality(self):
+        module = load_module()
+        text = "2024年系统规划与管理师真题解析 上午 选择题 答案解析"
+        payload = {
+            "winner": {
+                "parser": "liteparse",
+                "vote_score": 0.72,
+                "quality_label": "high",
+                "chars": len(text),
+                "non_space_chars": len(text.replace(" ", "")),
+                "repetition_metrics": {
+                    "duplicate_line_ratio": 0.0,
+                    "repeated_ngram_ratio": 0.0,
+                },
+            },
+            "profile": {"resolved": "none"},
+            "quality_gate": {"passed": True},
+            "_normalized_texts": {"liteparse": text},
+        }
+        expected = {
+            "min_vote_score": 0.7,
+            "quality_gate_passed": True,
+            "min_non_space_chars": 20,
+            "quality_label_not": ["empty", "bad"],
+            "text_contains_any": ["系统规划与管理师", "发票"],
+            "text_contains_all": ["2024", "真题"],
+            "max_duplicate_line_ratio": 0.05,
+        }
+
+        evaluation = module.evaluate_vote_expectations(payload, expected)
+
+        self.assertTrue(evaluation["passed"])
+        self.assertEqual(evaluation["check_count"], 7)
+
+    def test_build_golden_case_payload_for_exam_pdf(self):
+        module = load_module()
+        pdf = ROOT / "fixtures" / "2024年系统规划与管理师真题解析.pdf"
+        payload = module.build_golden_case_payload(
+            pdf,
+            ROOT,
+            "pymupdf,pdfplumber,liteparse",
+            3,
+            0.5,
+            120,
+            roots=[ROOT],
+        )
+
+        self.assertEqual(payload["command"], "vote")
+        self.assertEqual(payload["profile"], "none")
+        self.assertEqual(payload["max_pages"], 3)
+        self.assertIn("text_contains_any", payload["expected"])
+        self.assertIn("2024", payload["expected"]["text_contains_any"])
+
+    def test_golden_keywords_include_chinese_chapter_alias(self):
+        module = load_module()
+        metadata = {"chapter": "第12章"}
+        keywords = module.golden_keywords_for_pdf(ROOT / "第二轮第12章模拟题.pdf", metadata)
+
+        self.assertIn("第12章", keywords)
+        self.assertIn("第十二章", keywords)
 
     def test_qa_over_chunks_jsonl(self):
         module = load_module()

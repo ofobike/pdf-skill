@@ -4,6 +4,16 @@ This project is evolving from a PDF parser comparison helper into a PDF-first do
 
 ## Version Priorities
 
+### v4.12 - Customer Delivery Hardening
+
+Goal: move from core parsing strength to enterprise-style customer delivery.
+
+- Done: `customer_best.json` now carries `schema_version` and `customer_best.schema.json` is written with customer outputs.
+- Done: `customer-pack` generates field evidence crops from bbox data when available, plus `field_evidence/field_evidence.md/json`.
+- Done: `customer-pack` generates local `review.html` with page images, field list, bbox highlight, and table preview.
+- Done: `vote/probe/customer-pack/batch-customer-pack` support `--result-cache` and `--result-cache-dir` to reuse successful parser text.
+- Done: contract, bank statement, quotation, purchase order, report, and annual report profiles now have lightweight structured customer fields and field confidence.
+
 ### v4.1 - Skill Usability And Progressive Disclosure
 
 Goal: make the skill easier for Codex to trigger correctly and cheaper to load.
